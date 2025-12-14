@@ -1,0 +1,59 @@
+# Policy configuration for cargo xtask
+# This file allows customization of enforcement rules for different repo structures
+
+[allowlists]
+# Paths where locks are allowed (relative to repo root)
+lock_allowed = [
+    "runtime/",
+    "drivers/",
+    "xtask/",
+    "tests/",
+]
+
+# Paths where thread/task spawning is allowed
+spawn_allowed = [
+    "runtime/scheduler.rs",
+    "runtime/main.rs",
+    "xtask/",
+    "tests/",
+]
+
+# Paths where SSOT state type references are allowed
+# (e.g., MachineState, AppState, etc.)
+ssot_allowed = [
+    "state_owner.rs",
+    "state.rs",
+    "core/src/state.rs",
+    "xtask/",
+    "tests/",
+]
+
+[patterns]
+# Patterns to detect locks (regex)
+lock_patterns = [
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+    "tokio::sync::Mutex",
+    "tokio::sync::RwLock",
+    "parking_lot::Mutex",
+    "parking_lot::RwLock",
+    "\\.lock\\(\\)\\.await",
+]
+
+# Patterns to detect thread/task spawning
+spawn_patterns = [
+    "std::thread::spawn",
+    "tokio::spawn",
+    "tokio::task::spawn",
+]
+
+# SSOT state type names to check (will be matched as word boundaries)
+ssot_types = [
+    "MachineState",
+    # Add other state types here if you have multiple
+]
+
+[options]
+# Whether to fail if ripgrep is not found (false = warn but continue)
+require_ripgrep = false
+
