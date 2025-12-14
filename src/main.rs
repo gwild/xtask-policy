@@ -177,6 +177,8 @@ fn run_rg_policy(
                 "!**/*.lock",
                 "--glob",
                 "!**/Cargo.lock",
+                "--glob",
+                "!**/*.md",
                 pat,
                 ".",
             ])

@@ -145,6 +145,8 @@ fn scan_pattern(pattern: &str, allowlist: &[String]) -> Result<Vec<(String, Stri
             "!**/*.lock",
             "--glob",
             "!**/Cargo.lock",
+            "--glob",
+            "!**/*.md",
             pattern,
             ".",
         ])
