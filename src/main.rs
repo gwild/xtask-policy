@@ -3,6 +3,7 @@ mod config;
 
 use clap::{Parser, Subcommand};
 use std::fs;
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -38,12 +39,18 @@ fn main() {
 }
 
 fn run_check() {
-    // Load configuration
-    let config = match config::PolicyConfig::load() {
+    let ctx = match config::repo_context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = match config::PolicyConfig::load_from_path(&ctx.policy_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Failed to load policy config: {e}");
-            eprintln!("Using default hardcoded configuration");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
@@ -67,6 +74,8 @@ fn run_check() {
             .map(|s| s.as_str())
             .collect::<Vec<_>>(),
         config.options.require_ripgrep,
+        &config.options.rg_exclude_globs,
+        &ctx.scan_root,
     ));
 
     // 2) Spawning
@@ -86,6 +95,8 @@ fn run_check() {
             .map(|s| s.as_str())
             .collect::<Vec<_>>(),
         config.options.require_ripgrep,
+        &config.options.rg_exclude_globs,
+        &ctx.scan_root,
     ));
 
     // 3) SSOT name leakage
@@ -102,6 +113,8 @@ fn run_check() {
             &[&pattern],
             &ssot_allowed,
             config.options.require_ripgrep,
+            &config.options.rg_exclude_globs,
+            &ctx.scan_root,
         ));
     }
 
@@ -118,18 +131,25 @@ fn run_check() {
 }
 
 fn run_analyze(output_file: &str) {
-    // Load configuration
-    let config = match config::PolicyConfig::load() {
+    let ctx = match config::repo_context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let config = match config::PolicyConfig::load_from_path(&ctx.policy_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Failed to load policy config: {e}");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
 
     println!("Analyzing repository...");
 
-    let plan = match analyze::analyze_repo(&config) {
+    let plan = match analyze::analyze_repo(&config, &ctx.scan_root) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Analysis failed: {e}");
@@ -139,15 +159,27 @@ fn run_analyze(output_file: &str) {
 
     let plan_markdown = analyze::format_plan(&plan);
 
-    // Write to file
-    match fs::write(output_file, &plan_markdown) {
+    let output_path = {
+        let p = Path::new(output_file);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            ctx.scan_root.join(p)
+        }
+    };
+
+    // Write to file (relative paths are anchored at scan_root, not at the current dir)
+    match fs::write(&output_path, &plan_markdown) {
         Ok(_) => {
-            println!("✅ Cleanup plan written to: {}", output_file);
+            println!("✅ Cleanup plan written to: {}", output_path.display());
             println!("\nSummary:");
             println!("  Total violations: {}", plan.summary.total_violations);
             println!("  Files affected: {}", plan.summary.files_affected);
             if plan.summary.total_violations > 0 {
-                println!("\n⚠️  Review {} for detailed recommendations", output_file);
+                println!(
+                    "\n⚠️  Review {} for detailed recommendations",
+                    output_path.display()
+                );
             }
         }
         Err(e) => {
@@ -162,26 +194,37 @@ fn run_rg_policy(
     patterns: &[&str],
     allow_prefixes: &[&str],
     require_ripgrep: bool,
+    rg_exclude_globs: &[String],
+    scan_root: &Path,
 ) -> Vec<String> {
     let mut out = vec![];
 
     for pat in patterns {
         // ripgrep: list matching files with line numbers
+        let mut args: Vec<String> = vec![
+            "-n".to_string(),
+            "--hidden".to_string(),
+            "--glob".to_string(),
+            "!**/target/**".to_string(),
+            "--glob".to_string(),
+            "!**/*.lock".to_string(),
+            "--glob".to_string(),
+            "!**/Cargo.lock".to_string(),
+            "--glob".to_string(),
+            "!**/*.md".to_string(),
+        ];
+
+        for glob in rg_exclude_globs {
+            args.push("--glob".to_string());
+            args.push(format!("!{glob}"));
+        }
+
+        args.push(pat.to_string());
+        args.push(".".to_string());
+
         let rg = std::process::Command::new("rg")
-            .args([
-                "-n",
-                "--hidden",
-                "--glob",
-                "!target/**",
-                "--glob",
-                "!**/*.lock",
-                "--glob",
-                "!**/Cargo.lock",
-                "--glob",
-                "!**/*.md",
-                pat,
-                ".",
-            ])
+            .args(&args)
+            .current_dir(scan_root)
             .output();
 
         let Ok(rg) = rg else {

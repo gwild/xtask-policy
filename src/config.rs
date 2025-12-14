@@ -1,4 +1,55 @@
-use std::fs;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone)]
+pub struct RepoContext {
+    /// Root directory that should be scanned (usually the parent repo root).
+    pub scan_root: PathBuf,
+    /// Path to the policy.toml that configures scanning.
+    pub policy_path: PathBuf,
+}
+
+/// Determine where to scan and where to load policy from.
+///
+/// Supported layouts:
+/// - **Submodule layout** (parent repo): `<repo_root>/xtask/policy.toml` (scan_root = `<repo_root>`)
+/// - **Standalone xtask repo**: `<repo_root>/policy.toml` (scan_root = `<repo_root>`)
+///
+/// Fail-fast: if neither layout can be located, return a fatal error.
+pub fn repo_context() -> Result<RepoContext, String> {
+    let start = std::env::current_dir()
+        .map_err(|e| format!("FATAL: failed to read current working directory: {e}"))?;
+
+    // 1) Prefer submodule layout: find a directory that contains `xtask/policy.toml`
+    let mut cur: Option<&Path> = Some(&start);
+    while let Some(dir) = cur {
+        let candidate = dir.join("xtask").join("policy.toml");
+        if candidate.is_file() {
+            return Ok(RepoContext {
+                scan_root: dir.to_path_buf(),
+                policy_path: candidate,
+            });
+        }
+        cur = dir.parent();
+    }
+
+    // 2) Standalone layout: find nearest ancestor containing `policy.toml`
+    let mut cur: Option<&Path> = Some(&start);
+    while let Some(dir) = cur {
+        let candidate = dir.join("policy.toml");
+        if candidate.is_file() {
+            return Ok(RepoContext {
+                scan_root: dir.to_path_buf(),
+                policy_path: candidate,
+            });
+        }
+        cur = dir.parent();
+    }
+
+    Err("FATAL: could not locate policy.toml (expected either <repo>/xtask/policy.toml or <repo>/policy.toml). Run xtask from the repo root (or ensure the policy file exists).".to_string())
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct PolicyConfig {
@@ -25,6 +76,11 @@ pub struct Patterns {
 pub struct Options {
     #[serde(default = "default_require_ripgrep")]
     pub require_ripgrep: bool,
+
+    /// Additional ripgrep glob excludes (passed as `--glob !<pattern>`).
+    /// Examples: `audmon/**`, `**/target/**`
+    #[serde(default)]
+    pub rg_exclude_globs: Vec<String>,
 }
 
 fn default_require_ripgrep() -> bool {
@@ -33,9 +89,22 @@ fn default_require_ripgrep() -> bool {
 
 impl PolicyConfig {
     pub fn load() -> Result<Self, String> {
-        let config_path = "xtask/policy.toml";
-        let content = fs::read_to_string(config_path)
-            .map_err(|e| format!("Failed to read {config_path}: {e}"))?;
-        toml::from_str(&content).map_err(|e| format!("Failed to parse {config_path}: {e}"))
+        let ctx = repo_context()?;
+        Self::load_from_path(&ctx.policy_path)
+    }
+
+    pub fn load_from_path(policy_path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(policy_path).map_err(|e| {
+            format!(
+                "FATAL: failed to read policy file {}: {e}",
+                policy_path.display()
+            )
+        })?;
+        toml::from_str(&content).map_err(|e| {
+            format!(
+                "FATAL: failed to parse policy file {}: {e}",
+                policy_path.display()
+            )
+        })
     }
 }

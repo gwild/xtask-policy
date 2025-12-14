@@ -51,12 +51,17 @@ pub enum Priority {
     Low,    // Nice to have
 }
 
-pub fn analyze_repo(config: &PolicyConfig) -> Result<CleanupPlan, String> {
+pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPlan, String> {
     let mut violations = Vec::new();
 
     // Scan for locks
     for pattern in &config.patterns.lock_patterns {
-        let found = scan_pattern(pattern, &config.allowlists.lock_allowed)?;
+        let found = scan_pattern(
+            pattern,
+            &config.allowlists.lock_allowed,
+            &config.options.rg_exclude_globs,
+            scan_root,
+        )?;
         for (file, line) in found {
             violations.push(Violation {
                 rule: "Locks outside allowlist".to_string(),
@@ -70,7 +75,12 @@ pub fn analyze_repo(config: &PolicyConfig) -> Result<CleanupPlan, String> {
 
     // Scan for spawning
     for pattern in &config.patterns.spawn_patterns {
-        let found = scan_pattern(pattern, &config.allowlists.spawn_allowed)?;
+        let found = scan_pattern(
+            pattern,
+            &config.allowlists.spawn_allowed,
+            &config.options.rg_exclude_globs,
+            scan_root,
+        )?;
         for (file, line) in found {
             violations.push(Violation {
                 rule: "Spawning outside allowlist".to_string(),
@@ -85,7 +95,12 @@ pub fn analyze_repo(config: &PolicyConfig) -> Result<CleanupPlan, String> {
     // Scan for SSOT violations
     for ssot_type in &config.patterns.ssot_types {
         let pattern = format!(r"\b{}\b", ssot_type);
-        let found = scan_pattern(&pattern, &config.allowlists.ssot_allowed)?;
+        let found = scan_pattern(
+            &pattern,
+            &config.allowlists.ssot_allowed,
+            &config.options.rg_exclude_globs,
+            scan_root,
+        )?;
         for (file, line) in found {
             violations.push(Violation {
                 rule: format!("{} referenced outside owner module", ssot_type),
@@ -134,22 +149,36 @@ pub fn analyze_repo(config: &PolicyConfig) -> Result<CleanupPlan, String> {
     })
 }
 
-fn scan_pattern(pattern: &str, allowlist: &[String]) -> Result<Vec<(String, String)>, String> {
+fn scan_pattern(
+    pattern: &str,
+    allowlist: &[String],
+    rg_exclude_globs: &[String],
+    scan_root: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let mut args: Vec<String> = vec![
+        "-n".to_string(),
+        "--hidden".to_string(),
+        "--glob".to_string(),
+        "!**/target/**".to_string(),
+        "--glob".to_string(),
+        "!**/*.lock".to_string(),
+        "--glob".to_string(),
+        "!**/Cargo.lock".to_string(),
+        "--glob".to_string(),
+        "!**/*.md".to_string(),
+    ];
+
+    for glob in rg_exclude_globs {
+        args.push("--glob".to_string());
+        args.push(format!("!{glob}"));
+    }
+
+    args.push(pattern.to_string());
+    args.push(".".to_string());
+
     let rg = Command::new("rg")
-        .args([
-            "-n",
-            "--hidden",
-            "--glob",
-            "!target/**",
-            "--glob",
-            "!**/*.lock",
-            "--glob",
-            "!**/Cargo.lock",
-            "--glob",
-            "!**/*.md",
-            pattern,
-            ".",
-        ])
+        .args(&args)
+        .current_dir(scan_root)
         .output();
 
     let Ok(rg) = rg else {

@@ -57,3 +57,8 @@ ssot_types = [
 # Whether to fail if ripgrep is not found (false = warn but continue)
 require_ripgrep = false
 
+# Additional ripgrep excludes (submodules, generated dirs, etc.)
+rg_exclude_globs = [
+    "audmon/**",
+]
+
