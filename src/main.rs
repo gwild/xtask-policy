@@ -2,6 +2,7 @@ mod analyze;
 mod config;
 
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -118,6 +119,129 @@ fn run_check() {
         ));
     }
 
+    // 4) Fail-fast violations (classified if configured)
+    if !config.patterns.fallback_classes.is_empty() {
+        for class in &config.patterns.fallback_classes {
+            let pats: Vec<&str> = class.patterns.iter().map(|s| s.as_str()).collect();
+            let allow: Vec<&str> = if !class.allowed.is_empty() {
+                class.allowed.iter().map(|s| s.as_str()).collect()
+            } else {
+                config
+                    .allowlists
+                    .fallbacks_allowed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            failures.extend(run_rg_policy(
+                &format!("Fail-fast violations ({}) outside allowlist", class.name),
+                &pats,
+                &allow,
+                config.options.require_ripgrep,
+                &config.options.rg_exclude_globs,
+                &ctx.scan_root,
+            ));
+        }
+    } else {
+        let fallback_patterns: Vec<&str> = config
+            .patterns
+            .fallback_patterns
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        failures.extend(run_rg_policy(
+            "Fail-fast violations outside allowlist",
+            &fallback_patterns,
+            &config
+                .allowlists
+                .fallbacks_allowed
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            config.options.require_ripgrep,
+            &config.options.rg_exclude_globs,
+            &ctx.scan_root,
+        ));
+    }
+
+    // 5) Required config presence (no silent defaults)
+    failures.extend(check_required_config(&config, &ctx.scan_root));
+
+    // 6) Sensitive literals (IPs, secrets, absolute paths)
+    if !config.patterns.sensitive_classes.is_empty() {
+        for class in &config.patterns.sensitive_classes {
+            let pats: Vec<&str> = class.patterns.iter().map(|s| s.as_str()).collect();
+            let allow: Vec<&str> = if !class.allowed.is_empty() {
+                class.allowed.iter().map(|s| s.as_str()).collect()
+            } else {
+                config
+                    .allowlists
+                    .sensitive_allowed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            failures.extend(run_rg_policy(
+                &format!("Sensitive literals ({}) outside allowlist", class.name),
+                &pats,
+                &allow,
+                config.options.require_ripgrep,
+                &config.options.rg_exclude_globs,
+                &ctx.scan_root,
+            ));
+        }
+    }
+
+    // 7) Hardcoded numeric preview limits (magic numbers)
+    if !config.patterns.hardcode_classes.is_empty() {
+        for class in &config.patterns.hardcode_classes {
+            let pats: Vec<&str> = class.patterns.iter().map(|s| s.as_str()).collect();
+            let allow: Vec<&str> = if !class.allowed.is_empty() {
+                class.allowed.iter().map(|s| s.as_str()).collect()
+            } else {
+                config
+                    .allowlists
+                    .hardcode_allowed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            failures.extend(run_rg_policy(
+                &format!("Hardcoded preview limits ({}) outside allowlist", class.name),
+                &pats,
+                &allow,
+                config.options.require_ripgrep,
+                &config.options.rg_exclude_globs,
+                &ctx.scan_root,
+            ));
+        }
+    }
+
+    // 8) Style: channel labels should use standard colored RichText scheme
+    if !config.patterns.style_classes.is_empty() {
+        for class in &config.patterns.style_classes {
+            let pats: Vec<&str> = class.patterns.iter().map(|s| s.as_str()).collect();
+            let allow: Vec<&str> = if !class.allowed.is_empty() {
+                class.allowed.iter().map(|s| s.as_str()).collect()
+            } else {
+                config
+                    .allowlists
+                    .style_allowed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            failures.extend(run_rg_policy(
+                &format!("Style violations ({}) outside allowlist", class.name),
+                &pats,
+                &allow,
+                config.options.require_ripgrep,
+                &config.options.rg_exclude_globs,
+                &ctx.scan_root,
+            ));
+        }
+    }
+
     if failures.is_empty() {
         println!("policy: OK");
         return;
@@ -128,6 +252,156 @@ fn run_check() {
         eprintln!("  - {f}");
     }
     std::process::exit(2);
+}
+
+fn check_required_config(config: &config::PolicyConfig, scan_root: &Path) -> Vec<String> {
+    let mut out = vec![];
+
+    // ---- env (.env + process env) ----
+    let dotenv_path = scan_root.join(".env");
+    let dotenv_map = match fs::read_to_string(&dotenv_path) {
+        Ok(s) => parse_dotenv(&s),
+        Err(_) => HashMap::new(),
+    };
+
+    let process_env: HashMap<String, String> = std::env::vars().collect();
+
+    for group in &config.required.env_any_of {
+        let mut satisfied = false;
+        for key in &group.any_of {
+            if let Some(v) = process_env.get(key) {
+                if !v.trim().is_empty() {
+                    satisfied = true;
+                    break;
+                }
+            }
+            if let Some(v) = dotenv_map.get(key) {
+                if !v.trim().is_empty() {
+                    satisfied = true;
+                    break;
+                }
+            }
+        }
+        if !satisfied {
+            out.push(format!(
+                "Required config missing: at least one of env vars {:?} must be set (in process env or .env)",
+                group.any_of
+            ));
+        }
+    }
+
+    // ---- yaml ----
+    for req in &config.required.yaml_non_null {
+        let path = scan_root.join(&req.file);
+        let Ok(content) = fs::read_to_string(&path) else {
+            out.push(format!(
+                "Required config missing: YAML file '{}' not found at {}",
+                req.file,
+                path.display()
+            ));
+            continue;
+        };
+        let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                out.push(format!(
+                    "Required config invalid: YAML file '{}' failed to parse: {e}",
+                    req.file
+                ));
+                continue;
+            }
+        };
+
+        match yaml_path_non_null(&yaml, &req.path, req.all) {
+            Ok(true) => {}
+            Ok(false) => out.push(format!(
+                "Required config missing: YAML '{}' path '{}' is missing or null{}",
+                req.file,
+                req.path,
+                if req.all { " (expected non-null for all matches)" } else { "" }
+            )),
+            Err(e) => out.push(format!(
+                "Required config invalid: YAML '{}' path '{}': {e}",
+                req.file, req.path
+            )),
+        }
+    }
+
+    out
+}
+
+fn parse_dotenv(s: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for raw in s.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let mut val = v.trim().to_string();
+        // strip simple surrounding quotes
+        if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+            if val.len() >= 2 {
+                val = val[1..val.len() - 1].to_string();
+            }
+        }
+        out.insert(key, val);
+    }
+    out
+}
+
+fn yaml_path_non_null(root: &serde_yaml::Value, path: &str, all: bool) -> Result<bool, String> {
+    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Err("empty path".to_string());
+    }
+
+    let mut nodes: Vec<&serde_yaml::Value> = vec![root];
+    for seg in segments {
+        let mut next = vec![];
+        for n in nodes {
+            match seg {
+                "*" => match n {
+                    serde_yaml::Value::Mapping(m) => {
+                        for (_, v) in m {
+                            next.push(v);
+                        }
+                    }
+                    serde_yaml::Value::Sequence(seq) => {
+                        for v in seq {
+                            next.push(v);
+                        }
+                    }
+                    _ => {}
+                },
+                key => match n {
+                    serde_yaml::Value::Mapping(m) => {
+                        let k = serde_yaml::Value::String(key.to_string());
+                        if let Some(v) = m.get(&k) {
+                            next.push(v);
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+        nodes = next;
+        if nodes.is_empty() {
+            return Ok(false);
+        }
+    }
+
+    if all {
+        Ok(nodes.iter().all(|v| !matches!(v, serde_yaml::Value::Null)))
+    } else {
+        Ok(nodes.iter().any(|v| !matches!(v, serde_yaml::Value::Null)))
+    }
 }
 
 fn run_analyze(output_file: &str) {
@@ -244,7 +518,9 @@ fn run_rg_policy(
         let stdout = String::from_utf8_lossy(&rg.stdout);
         for line in stdout.lines() {
             // line format: path:line:match...
-            let path = line.split(':').next().unwrap_or("");
+            let Some(path) = line.split(':').next() else {
+                continue;
+            };
             if is_allowed(path, allow_prefixes) {
                 continue;
             }

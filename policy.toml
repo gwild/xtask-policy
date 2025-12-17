@@ -18,6 +18,22 @@ spawn_allowed = [
     "tests/",
 ]
 
+# Paths where fail-fast violations are allowed (prefer empty; exceptions should be narrow)
+fallbacks_allowed = []
+
+# Paths where sensitive literals are allowed (prefer config files only)
+sensitive_allowed = [
+  ".env",
+  ".yaml",
+  ".yml",
+]
+
+# Paths where hardcoded numeric "preview limits" are allowed (prefer none)
+hardcode_allowed = []
+
+# Paths where style violations are allowed (prefer none)
+style_allowed = []
+
 # Paths where SSOT state type references are allowed
 # (e.g., MachineState, AppState, etc.)
 ssot_allowed = [
@@ -53,6 +69,68 @@ ssot_types = [
     # Add other state types here if you have multiple
 ]
 
+# Patterns to detect fail-fast violations
+fallback_patterns = [
+    "\\.unwrap_or\\b",
+    "\\.unwrap_or_else\\b",
+    "\\.unwrap_or_default\\b",
+    "\\.or_else\\b",
+    "\\.get_or_insert\\b",
+    "\\.get_or_insert_with\\b",
+]
+
+# Classified pattern groups for reporting (preferred). If present, `xtask` will report by group.
+# Each group can optionally have its own allowlist under `allowed`.
+fallback_classes = [
+  { name = "unwrap_or", patterns = ["\\.unwrap_or\\b"] },
+  { name = "unwrap_or_else", patterns = ["\\.unwrap_or_else\\b"] },
+  { name = "unwrap_or_default", patterns = ["\\.unwrap_or_default\\b"] },
+  { name = "or_else", patterns = ["\\.or_else\\b"] },
+  { name = "get_or_insert", patterns = ["\\.get_or_insert\\b"] },
+  { name = "get_or_insert_with", patterns = ["\\.get_or_insert_with\\b"] },
+]
+
+# Sensitive literals that must not appear in code (allow in .env / yaml only)
+sensitive_classes = [
+  { name = "ip_v4", patterns = ["\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b"] },
+  { name = "abs_path_unix", patterns = ["[\\\"']/(?:[^\\\"']+)"] },
+  { name = "abs_path_windows", patterns = ["[\\\"'][A-Za-z]:\\\\\\\\(?:[^\\\"']+)"] },
+  { name = "secret_literal", patterns = ["(?i)\\b(pass(word|wd)?|secret|token|api[_-]?key)\\b\\s*[:=]\\s*[\\\"'][^\\\"']+[\\\"']"] },
+]
+
+# Hardcoded numeric "preview limits" (magic numbers) that should be config/state-driven
+# rather than silently constraining the UI.
+hardcode_classes = [
+  { name = "partials_preview_limit", patterns = ["let\\s+show_partials\\s*=\\s*\\d+usize\\s*;"] },
+  { name = "channels_preview_limit", patterns = ["let\\s+show_channels\\s*=\\s*channels\\.min\\(\\d+\\)\\s*;"] },
+]
+
+# Style: channel labels should use the standard colored RichText scheme
+# (i.e., not plain `ui.label(format!("Ch ..."))`).
+style_classes = [
+  { name = "ch_label_plain", patterns = ["ui\\.label\\(\\s*format!\\(\\\"Ch"] },
+]
+
+[required]
+# For environment variables: require that at least one of the listed keys exists and is non-empty
+# (checked against the current process env AND the repo root `.env` file if present).
+env_any_of = [
+  { any_of = ["PG_HOST", "DB_HOST"] },
+  { any_of = ["PG_PORT", "DB_PORT"] },
+  { any_of = ["PG_USER", "DB_USER"] },
+  { any_of = ["PG_PASSWORD", "DB_PASSWORD"] },
+  { any_of = ["PG_DATABASE", "DB_NAME"] },
+]
+
+# For YAML files: require that the path exists and is not null.
+# Path is dot-separated; use `*` to iterate maps/sequences.
+yaml_non_null = [
+  { file = "presets.yaml", path = "*.z_up_step", all = true },
+  { file = "presets.yaml", path = "*.z_down_step", all = true },
+  { file = "string_driver.yaml", path = "common.PREDICTOR_PATH" },
+  { file = "string_driver.yaml", path = "common.CODE_PATH" },
+]
+
 [options]
 # Whether to fail if ripgrep is not found (false = warn but continue)
 require_ripgrep = false
@@ -60,5 +138,7 @@ require_ripgrep = false
 # Additional ripgrep excludes (submodules, generated dirs, etc.)
 rg_exclude_globs = [
     "audmon/**",
+    "xtask/policy.toml",
+    ".cursorrules",
 ]
 
