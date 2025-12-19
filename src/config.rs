@@ -58,6 +58,39 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub required: RequiredConfig,
     pub options: Options,
+    #[serde(default)]
+    pub markdown: MarkdownPolicy,
+    #[serde(default)]
+    pub websocket: WebsocketPolicy,
+    #[serde(default)]
+    pub legacy: LegacyPolicy,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct MarkdownPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    pub required_root: Option<String>,
+    #[serde(default)]
+    pub allowed_prefixes: Vec<String>,
+    #[serde(default)]
+    pub allowed_files: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct WebsocketPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_prefixes: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct LegacyPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    pub protected_root: Option<String>,
+    pub manifest_file: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -71,10 +104,20 @@ pub struct Allowlists {
     pub hardcode_allowed: Vec<String>,
     #[serde(default)]
     pub style_allowed: Vec<String>,
+    #[serde(default)]
+    pub forbidden_allowed: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct FallbackClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ForbiddenClass {
     pub name: String,
     pub patterns: Vec<String>,
     #[serde(default)]
@@ -113,6 +156,8 @@ pub struct Patterns {
     pub fallback_patterns: Vec<String>,
     #[serde(default)]
     pub fallback_classes: Vec<FallbackClass>,
+    #[serde(default)]
+    pub forbidden_classes: Vec<ForbiddenClass>,
     #[serde(default)]
     pub sensitive_classes: Vec<SensitiveClass>,
     #[serde(default)]
