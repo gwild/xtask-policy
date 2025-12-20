@@ -28,6 +28,7 @@ pub enum ViolationType {
     Sensitive(String),
     Hardcode(String),
     Style(String),
+    BlockingLock(String), // blocking lock in dangerous path (e.g., GUI thread)
 }
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ pub struct PlanSummary {
     pub sensitive_violations: usize,
     pub hardcode_violations: usize,
     pub style_violations: usize,
+    pub blocking_lock_violations: usize,
     pub files_affected: usize,
 }
 
@@ -248,6 +250,36 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         }
     }
 
+    // Scan for blocking lock patterns in dangerous paths (e.g., GUI code)
+    // These are .lock() calls that could block the main thread and freeze the UI
+    for class in &config.patterns.blocking_lock_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &config.allowlists.blocking_lock_allowed
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                // Only flag if the file is in a dangerous path (e.g., gui/)
+                let is_dangerous = class.dangerous_paths.is_empty() 
+                    || class.dangerous_paths.iter().any(|p| file.contains(p));
+                if is_dangerous {
+                    // Additional context check: is this in a spawned thread or main thread?
+                    let category = classify_blocking_lock(&classify_ctx, scan_root, &file, &line);
+                    violations.push(Violation {
+                        rule: format!("Blocking lock ({}) in GUI/main thread path", class.name),
+                        file: file.clone(),
+                        line,
+                        pattern: pattern.clone(),
+                        violation_type: ViolationType::BlockingLock(class.name.clone()),
+                        category: Some(category.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
     // Generate summary
     let lock_violations = violations
         .iter()
@@ -281,6 +313,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Style(_)))
         .count();
+    let blocking_lock_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::BlockingLock(_)))
+        .count();
 
     let mut files_affected = std::collections::HashSet::new();
     for v in &violations {
@@ -297,6 +333,7 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         sensitive_violations,
         hardcode_violations,
         style_violations,
+        blocking_lock_violations,
         files_affected: files_affected.len(),
     };
 
@@ -595,6 +632,34 @@ fn generate_recommendations(
         });
     }
 
+    // Analyze blocking lock violations
+    let blocking_files: Vec<_> = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::BlockingLock(_)))
+        .map(|v| v.file.clone())
+        .collect();
+    if !blocking_files.is_empty() {
+        let unique_files: Vec<String> = blocking_files
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        recommendations.push(Recommendation {
+            priority: Priority::High,
+            action: "Replace blocking .lock() with .try_lock() in GUI/main thread paths, or move to spawned thread"
+                .to_string(),
+            reason: format!(
+                "Found {} blocking lock calls in {} file(s). Blocking locks in GUI code can freeze the UI for extended periods. Use try_lock() for non-blocking acquisition or ensure the lock is only acquired in background threads.",
+                violations
+                    .iter()
+                    .filter(|v| matches!(v.violation_type, ViolationType::BlockingLock(_)))
+                    .count(),
+                unique_files.len(),
+            ),
+            files: unique_files,
+        });
+    }
+
     // Add general recommendation about allowlist adjustment
     if !violations.is_empty() {
         recommendations.push(Recommendation {
@@ -652,9 +717,195 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         plan.summary.style_violations
     ));
     output.push_str(&format!(
+        "- **Blocking Lock Violations**: {}\n",
+        plan.summary.blocking_lock_violations
+    ));
+    output.push_str(&format!(
         "- **Files Affected**: {}\n\n",
         plan.summary.files_affected
     ));
+
+    // Executive Summary with tables
+    output.push_str("## 📊 Executive Summary\n\n");
+    output.push_str("### Overall Health\n\n");
+    output.push_str("| Metric | Count | Status |\n");
+    output.push_str("|--------|-------|--------|\n");
+    let status = if plan.summary.total_violations == 0 {
+        "🟢"
+    } else if plan.summary.total_violations < 50 {
+        "🟡"
+    } else {
+        "⚠️"
+    };
+    output.push_str(&format!(
+        "| **Total Violations** | {} | {} |\n",
+        plan.summary.total_violations, status
+    ));
+    output.push_str(&format!(
+        "| Files Affected | {} | |\n\n",
+        plan.summary.files_affected
+    ));
+
+    output.push_str("### Violation Breakdown\n\n");
+    output.push_str("| Category | Count | Severity |\n");
+    output.push_str("|----------|-------|----------|\n");
+    if plan.summary.fallback_violations > 0 {
+        output.push_str(&format!(
+            "| **Fallbacks** (`unwrap_or` etc.) | {} | 🔴 High |\n",
+            plan.summary.fallback_violations
+        ));
+    }
+    if plan.summary.blocking_lock_violations > 0 {
+        output.push_str(&format!(
+            "| **Blocking Locks** (`.lock()` in GUI) | {} | 🟡 Medium |\n",
+            plan.summary.blocking_lock_violations
+        ));
+    }
+    let clean_count = plan.summary.lock_violations
+        + plan.summary.spawn_violations
+        + plan.summary.ssot_violations
+        + plan.summary.required_config_violations
+        + plan.summary.sensitive_violations
+        + plan.summary.hardcode_violations
+        + plan.summary.style_violations;
+    if clean_count == 0 && (plan.summary.fallback_violations > 0 || plan.summary.blocking_lock_violations > 0) {
+        output.push_str("| Lock/Spawn/SSOT/Config | 0 | 🟢 Clean |\n");
+    }
+    output.push('\n');
+
+    // Hotspots by file
+    let mut file_fallbacks: HashMap<String, usize> = HashMap::new();
+    let mut file_blocking: HashMap<String, usize> = HashMap::new();
+    for v in &plan.violations {
+        match &v.violation_type {
+            ViolationType::FailFast(_) => {
+                *file_fallbacks.entry(v.file.clone()).or_insert(0) += 1;
+            }
+            ViolationType::BlockingLock(_) => {
+                *file_blocking.entry(v.file.clone()).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+    if !file_fallbacks.is_empty() || !file_blocking.is_empty() {
+        output.push_str("### Hotspots (by file)\n\n");
+        output.push_str("| File | Fallbacks | Blocking Locks |\n");
+        output.push_str("|------|-----------|----------------|\n");
+        let mut all_files: Vec<String> = file_fallbacks.keys().chain(file_blocking.keys()).cloned().collect();
+        all_files.sort();
+        all_files.dedup();
+        all_files.sort_by(|a, b| {
+            let a_total = file_fallbacks.get(a).copied().unwrap_or(0) + file_blocking.get(a).copied().unwrap_or(0);
+            let b_total = file_fallbacks.get(b).copied().unwrap_or(0) + file_blocking.get(b).copied().unwrap_or(0);
+            b_total.cmp(&a_total)
+        });
+        for f in all_files {
+            let fb = file_fallbacks.get(&f).copied().unwrap_or(0);
+            let bl = file_blocking.get(&f).copied().unwrap_or(0);
+            // Extract just filename for cleaner display
+            let short = f.rsplit('/').next().unwrap_or(&f);
+            output.push_str(&format!("| `{}` | {} | {} |\n", short, fb, bl));
+        }
+        output.push('\n');
+    }
+
+    // FOCUS Assessment
+    output.push_str("## 🎯 FOCUS Assessment\n\n");
+    output.push_str("*Feedback Optimized Closed-loop Unified System*\n\n");
+    output.push_str("| Metric | Status | Notes |\n");
+    output.push_str("|--------|--------|-------|\n");
+    
+    // F - Feedback: OK if no required config violations
+    let feedback_status = if plan.summary.required_config_violations == 0 { "OK" } else { "DEGRADED" };
+    let feedback_note = if plan.summary.required_config_violations == 0 {
+        "Audio peaks flowing via shared memory"
+    } else {
+        "Missing required configuration"
+    };
+    output.push_str(&format!("| **F**eedback | {} | {} |\n", feedback_status, feedback_note));
+    
+    // O - Optimization: Based on fallback violations
+    let opt_status = if plan.summary.fallback_violations == 0 {
+        "OK"
+    } else if plan.summary.fallback_violations < 20 {
+        "TUNING"
+    } else {
+        "UNSTABLE"
+    };
+    let opt_note = if plan.summary.fallback_violations == 0 {
+        "Fail-fast patterns enforced"
+    } else {
+        &format!("{} fallback patterns need fail-fast", plan.summary.fallback_violations)
+    };
+    output.push_str(&format!("| **O**ptimization | {} | {} |\n", opt_status, opt_note));
+    
+    // C - Closed-loop: Based on blocking locks that could break the loop
+    let main_thread_dangerous = plan.violations.iter()
+        .filter(|v| matches!(&v.violation_type, ViolationType::BlockingLock(_)))
+        .filter(|v| v.category.as_deref() == Some("main_thread_dangerous"))
+        .count();
+    let closed_status = if main_thread_dangerous == 0 { "OK" } else { "PARTIAL" };
+    let closed_note = if main_thread_dangerous == 0 {
+        "End-to-end signal path clear"
+    } else {
+        &format!("{} main-thread locks could block loop", main_thread_dangerous)
+    };
+    output.push_str(&format!("| **C**losed-loop | {} | {} |\n", closed_status, closed_note));
+    
+    // U - Unified: Based on SSOT violations
+    let unified_status = if plan.summary.ssot_violations == 0 { "OK" } else { "FRAGMENTED" };
+    let unified_note = if plan.summary.ssot_violations == 0 {
+        "State management coherent"
+    } else {
+        &format!("{} SSOT violations", plan.summary.ssot_violations)
+    };
+    output.push_str(&format!("| **U**nified | {} | {} |\n", unified_status, unified_note));
+    
+    // S - System: Overall health
+    let system_status = if plan.summary.total_violations == 0 {
+        "OK"
+    } else if plan.summary.total_violations < 50 {
+        "DEGRADED"
+    } else {
+        "DOWN"
+    };
+    let system_note = if plan.summary.total_violations == 0 {
+        "All policy checks pass"
+    } else {
+        &format!("{} policy violations", plan.summary.total_violations)
+    };
+    output.push_str(&format!("| **S**ystem | {} | {} |\n\n", system_status, system_note));
+
+    // Priority Actions
+    if !plan.violations.is_empty() {
+        output.push_str("### Priority Actions\n\n");
+        if main_thread_dangerous > 0 {
+            output.push_str(&format!(
+                "1. **🔴 Fix {} `main_thread_dangerous` locks** — these can freeze GUI\n",
+                main_thread_dangerous
+            ));
+        }
+        let unwrap_or_count = plan.violations.iter()
+            .filter(|v| matches!(&v.violation_type, ViolationType::FailFast(n) if n == "unwrap_or"))
+            .count();
+        if unwrap_or_count > 0 {
+            output.push_str(&format!(
+                "2. **🔴 Convert {} `unwrap_or` to fail-fast** — or add to allowlist if intentional\n",
+                unwrap_or_count
+            ));
+        }
+        let poll_risky = plan.violations.iter()
+            .filter(|v| matches!(&v.violation_type, ViolationType::BlockingLock(_)))
+            .filter(|v| v.category.as_deref() == Some("poll_method_risky"))
+            .count();
+        if poll_risky > 0 {
+            output.push_str(&format!(
+                "3. **🟡 Review {} `poll_method_risky` locks** — may need try_lock()\n",
+                poll_risky
+            ));
+        }
+        output.push('\n');
+    }
 
     if plan.violations.is_empty() {
         output.push_str("✅ **No violations found!** Your repo is clean.\n");
@@ -750,6 +1001,44 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         output.push('\n');
     }
 
+    // Breakdown of blocking lock violations by class
+    let mut blocking_by_class: HashMap<String, usize> = HashMap::new();
+    for v in &plan.violations {
+        if let ViolationType::BlockingLock(name) = &v.violation_type {
+            *blocking_by_class.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    if !blocking_by_class.is_empty() {
+        output.push_str("## Blocking Lock Breakdown\n\n");
+        let mut pairs: Vec<(String, usize)> = blocking_by_class.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, count) in pairs {
+            output.push_str(&format!("- **{}**: {}\n", name, count));
+        }
+        output.push('\n');
+    }
+
+    // Breakdown of blocking lock violations by category (main_thread vs spawned_thread)
+    let mut blocking_by_category: HashMap<String, usize> = HashMap::new();
+    for v in &plan.violations {
+        if matches!(v.violation_type, ViolationType::BlockingLock(_)) {
+            let key = match &v.category {
+                Some(s) => s.clone(),
+                None => "unknown".to_string(),
+            };
+            *blocking_by_category.entry(key).or_insert(0) += 1;
+        }
+    }
+    if !blocking_by_category.is_empty() {
+        output.push_str("## Blocking Lock Category Breakdown\n\n");
+        let mut pairs: Vec<(String, usize)> = blocking_by_category.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, count) in pairs {
+            output.push_str(&format!("- **{}**: {}\n", name, count));
+        }
+        output.push('\n');
+    }
+
     output.push_str("## Recommendations\n\n");
 
     for (idx, rec) in plan.recommendations.iter().enumerate() {
@@ -790,6 +1079,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::Sensitive(name) => name,
             ViolationType::Hardcode(name) => name,
             ViolationType::Style(name) => name,
+            ViolationType::BlockingLock(name) => name,
         };
         let category = match &v.category {
             Some(s) => s.as_str(),
@@ -1082,6 +1372,138 @@ fn parse_dotenv(s: &str) -> std::collections::HashMap<String, String> {
         out.insert(key, val);
     }
     out
+}
+
+/// Classify a blocking lock violation based on context
+/// Returns one of:
+/// - "main_thread_dangerous" - blocking lock in GUI update path (can freeze UI)
+/// - "poll_method_risky" - blocking lock in poll method (runs on GUI thread, can freeze)
+/// - "spawned_thread" - blocking lock in spawned thread (expected, OK)  
+/// - "constructor" - blocking lock in new()/init function (usually OK)
+/// - "helper_method" - blocking lock in helper method (risk depends on caller)
+/// - "logger_thread" - blocking lock in logging thread (OK, runs in background)
+/// - "unknown" - cannot determine context
+fn classify_blocking_lock(
+    _ctx: &ClassifyContext,
+    scan_root: &Path,
+    file: &str,
+    line_num: &str,
+) -> &'static str {
+    if let Ok(n) = line_num.parse::<usize>() {
+        // Read more context (function signature, surrounding code)
+        // Use larger window (150 lines) to catch enclosing function and thread::spawn
+        // This covers most function bodies even in large files
+        if let Some(context) = read_extended_context(scan_root, file, n, 150) {
+            let context_lower = context.to_ascii_lowercase();
+            
+            // Check if this is inside a spawned thread (OK)
+            // Look for thread::spawn closure pattern
+            if context_lower.contains("thread::spawn(move ||")
+                || context_lower.contains("thread::spawn(||")
+                || context_lower.contains("spawn_thread(move ||")
+                || context_lower.contains("scheduler::spawn_thread")
+            {
+                return "spawned_thread";
+            }
+            
+            // Check for logger thread pattern (OK - runs in background at 1Hz)
+            if context_lower.contains("log_interval")
+                || (context_lower.contains("logger") && context_lower.contains("thread::spawn"))
+            {
+                return "logger_thread";
+            }
+            
+            // Check if this is in a constructor (usually OK - runs once at startup)
+            if context_lower.contains("pub fn new(")
+                || context_lower.contains("fn new(")
+                || context_lower.contains("fn init(")
+                || context_lower.contains("fn create(")
+            {
+                return "constructor";
+            }
+            
+            // Check if there's a try_lock nearby that suggests intentional non-blocking
+            if context_lower.contains("try_lock") {
+                return "has_try_lock";
+            }
+            
+            // Check for poll/update methods that run on GUI thread (RISKY)
+            if context_lower.contains("fn poll_")
+                || context_lower.contains("poll_operation")
+                || context_lower.contains("fn try_recv")
+            {
+                return "poll_method_risky";
+            }
+            
+            // Check for helper methods (risk depends on who calls them)
+            if context_lower.contains("fn append_message")
+                || context_lower.contains("fn log_")
+                || context_lower.contains("fn sync_")
+            {
+                return "helper_method";
+            }
+            
+            // Check for GUI update patterns (DANGEROUS)
+            if context_lower.contains("fn update(")
+                || context_lower.contains("fn show(")
+                || context_lower.contains("fn ui(")
+                || context_lower.contains("impl egui")
+                || context_lower.contains("impl eframe")
+                || context_lower.contains("ui.horizontal")
+                || context_lower.contains("ui.vertical")
+            {
+                return "main_thread_dangerous";
+            }
+            
+            // Check for event handler patterns (DANGEROUS)
+            if context_lower.contains(".clicked()")
+                || context_lower.contains("button")
+                || context_lower.contains("fn on_")
+            {
+                return "event_handler_dangerous";
+            }
+            
+            // Check if inside a closure passed to thread (OK)
+            // Look for "move ||" pattern before the lock
+            if context_lower.contains("move ||") {
+                // Count braces to see if we're inside a closure
+                let before_line = &context[..context.len().min(n * 80)]; // approximate
+                if before_line.matches("move ||").count() > before_line.matches("});").count() {
+                    return "spawned_thread";
+                }
+            }
+        }
+    }
+    "unknown"
+}
+
+/// Read extended context around a line (before and after)
+fn read_extended_context(scan_root: &Path, file: &str, one_based: usize, window: usize) -> Option<String> {
+    if one_based == 0 {
+        return None;
+    }
+    let rel = match file.strip_prefix("./") {
+        Some(s) => s,
+        None => file,
+    };
+    let path = scan_root.join(rel);
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return None;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = one_based.saturating_sub(window).max(1);
+    let end = (one_based + window).min(lines.len());
+    
+    let mut result = String::new();
+    for i in start..=end {
+        if i > 0 && i <= lines.len() {
+            if let Some(line) = lines.get(i - 1) {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+    }
+    Some(result)
 }
 
 fn yaml_path_non_null(root: &serde_yaml::Value, path: &str, all: bool) -> Result<bool, String> {

@@ -13,29 +13,17 @@ pub struct RepoContext {
 
 /// Determine where to scan and where to load policy from.
 ///
-/// Supported layouts:
-/// - **Submodule layout** (parent repo): `<repo_root>/xtask/policy.toml` (scan_root = `<repo_root>`)
-/// - **Standalone xtask repo**: `<repo_root>/policy.toml` (scan_root = `<repo_root>`)
+/// Supported layouts (checked in order):
+/// 1. **Parent repo layout**: `<repo_root>/policy.toml` (policy in parent, xtask is submodule)
+/// 2. **Submodule layout**: `<repo_root>/xtask/policy.toml` (legacy/standalone testing)
 ///
 /// Fail-fast: if neither layout can be located, return a fatal error.
 pub fn repo_context() -> Result<RepoContext, String> {
     let start = std::env::current_dir()
         .map_err(|e| format!("FATAL: failed to read current working directory: {e}"))?;
 
-    // 1) Prefer submodule layout: find a directory that contains `xtask/policy.toml`
-    let mut cur: Option<&Path> = Some(&start);
-    while let Some(dir) = cur {
-        let candidate = dir.join("xtask").join("policy.toml");
-        if candidate.is_file() {
-            return Ok(RepoContext {
-                scan_root: dir.to_path_buf(),
-                policy_path: candidate,
-            });
-        }
-        cur = dir.parent();
-    }
-
-    // 2) Standalone layout: find nearest ancestor containing `policy.toml`
+    // 1) Prefer parent repo layout: find nearest ancestor containing `policy.toml` at root level
+    //    This is the recommended layout where policy.toml lives in the parent repo, not the submodule.
     let mut cur: Option<&Path> = Some(&start);
     while let Some(dir) = cur {
         let candidate = dir.join("policy.toml");
@@ -48,7 +36,20 @@ pub fn repo_context() -> Result<RepoContext, String> {
         cur = dir.parent();
     }
 
-    Err("FATAL: could not locate policy.toml (expected either <repo>/xtask/policy.toml or <repo>/policy.toml). Run xtask from the repo root (or ensure the policy file exists).".to_string())
+    // 2) Fallback: submodule layout (xtask/policy.toml) for standalone testing
+    let mut cur: Option<&Path> = Some(&start);
+    while let Some(dir) = cur {
+        let candidate = dir.join("xtask").join("policy.toml");
+        if candidate.is_file() {
+            return Ok(RepoContext {
+                scan_root: dir.to_path_buf(),
+                policy_path: candidate,
+            });
+        }
+        cur = dir.parent();
+    }
+
+    Err("FATAL: could not locate policy.toml (expected <repo>/policy.toml or <repo>/xtask/policy.toml). Run xtask from the repo root (or ensure the policy file exists).".to_string())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -106,6 +107,8 @@ pub struct Allowlists {
     pub style_allowed: Vec<String>,
     #[serde(default)]
     pub forbidden_allowed: Vec<String>,
+    #[serde(default)]
+    pub blocking_lock_allowed: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -149,6 +152,17 @@ pub struct StyleClass {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct BlockingLockClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    /// Paths where blocking locks are considered dangerous (e.g., GUI code)
+    #[serde(default)]
+    pub dangerous_paths: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct Patterns {
     pub lock_patterns: Vec<String>,
     pub spawn_patterns: Vec<String>,
@@ -164,6 +178,8 @@ pub struct Patterns {
     pub hardcode_classes: Vec<HardcodeClass>,
     #[serde(default)]
     pub style_classes: Vec<StyleClass>,
+    #[serde(default)]
+    pub blocking_lock_classes: Vec<BlockingLockClass>,
 }
 
 #[derive(Debug, serde::Deserialize)]
