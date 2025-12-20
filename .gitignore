@@ -1,3 +1,6 @@
 Cargo.lock
 target/
 
+# OS
+.DS_Store
+
