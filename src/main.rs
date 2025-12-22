@@ -296,6 +296,9 @@ fn run_check() {
     // 10) WebSocket send-after-close guard (Python)
     failures.extend(check_websocket_send_guard(&config, &ctx.scan_root));
 
+    // 11) SSOT guard: circle_center must never be overwritten during regeneration
+    failures.extend(check_circle_center_regeneration_ssot(&ctx.scan_root));
+
     // 11) Legacy directory is write-protected by manifest (explicit user permission step)
     failures.extend(check_legacy_manifest(&config, &ctx.scan_root));
 
@@ -606,6 +609,70 @@ fn check_websocket_send_guard(config: &config::PolicyConfig, scan_root: &Path) -
             failures.push(format!(
                 "WebSocket send loop must handle WebSocketDisconnect (send_json in while True): {} (while_line={:?}, send_line={:?})",
                 rel_s, while_line, send_line
+            ));
+        }
+    }
+
+    failures
+}
+
+fn check_circle_center_regeneration_ssot(scan_root: &Path) -> Vec<String> {
+    // Repo-specific SSOT invariant:
+    // - app_state['circle_center'] is the stable alignment reference for circle execution.
+    // - execution_state['initial_pose'] may be updated to the 0° start pose during execution.
+    // - Therefore regenerate_circle_paths_if_needed() must NEVER assign to circle_center,
+    //   or it will silently move the center and make subsequent executes fail the start gate.
+    //
+    // This is intentionally a targeted parser (not a regex policy) because forbidden_classes
+    // are line-based ripgrep scans and cannot scope matches to a single function.
+    let mut failures = vec![];
+
+    let path = scan_root.join("server.py");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return failures,
+    };
+
+    let mut in_regen = false;
+    let mut regen_start_line: Option<usize> = None;
+
+    for (i, raw_line) in content.lines().enumerate() {
+        let line_no = i + 1;
+        let line = raw_line.trim_end();
+
+        if !in_regen && line.contains("async def regenerate_circle_paths_if_needed") {
+            in_regen = true;
+            regen_start_line = Some(line_no);
+            continue;
+        }
+
+        if !in_regen {
+            continue;
+        }
+
+        // Exit on the next top-level def/async def (column 0).
+        if (line.starts_with("def ") || line.starts_with("async def "))
+            && line_no != regen_start_line.unwrap_or(line_no)
+        {
+            in_regen = false;
+        }
+
+        if !in_regen {
+            continue;
+        }
+
+        // Flag any assignment to circle_center inside this function.
+        // Ignore reads like app_state.get('circle_center') and only block writes.
+        let assigns_single = line.contains("app_state['circle_center']")
+            && line.contains('=')
+            && !line.contains(".get(");
+        let assigns_double = line.contains("app_state[\"circle_center\"]")
+            && line.contains('=')
+            && !line.contains(".get(");
+        if assigns_single || assigns_double {
+            failures.push(format!(
+                "SSOT policy: regenerate_circle_paths_if_needed must not assign app_state['circle_center']: server.py:{}",
+                line_no
             ));
         }
     }
