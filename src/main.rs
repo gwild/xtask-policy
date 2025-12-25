@@ -302,6 +302,9 @@ fn run_check() {
     // 11) Legacy directory is write-protected by manifest (explicit user permission step)
     failures.extend(check_legacy_manifest(&config, &ctx.scan_root));
 
+    // 12) Prescriptive adjustment-process invariants (stringdriver control loop)
+    failures.extend(check_adjustment_process_policy(&ctx.scan_root));
+
     if failures.is_empty() {
         println!("policy: OK");
         return;
@@ -312,6 +315,100 @@ fn run_check() {
         eprintln!("  - {f}");
     }
     std::process::exit(2);
+}
+
+fn check_adjustment_process_policy(scan_root: &Path) -> Vec<String> {
+    let mut failures = vec![];
+
+    let ops_path = scan_root.join("src/operations.rs");
+    let content = match std::fs::read_to_string(&ops_path) {
+        Ok(s) => s,
+        Err(e) => {
+            failures.push(format!(
+                "Adjustment policy: failed to read {}: {e}",
+                ops_path.display()
+            ));
+            return failures;
+        }
+    };
+
+    // Helper for extracting a function-ish block by start token and next token.
+    fn slice_block<'a>(hay: &'a str, start_pat: &str, next_pat: &str) -> Option<&'a str> {
+        let start = hay.find(start_pat)?;
+        let rest = &hay[start..];
+        let search_start = start_pat.len().min(rest.len());
+        let end = match rest[search_start..].find(next_pat) {
+            Some(i) => i + search_start,
+            None => rest.len(),
+        };
+        Some(&rest[..end])
+    }
+
+    // A) There must be exactly one audio sample per iteration: update_from_slot() only in run_adjustment_iteration.
+    let update_calls = content.matches("update_from_slot();").count();
+    if update_calls != 1 {
+        failures.push(format!(
+            "Adjustment policy: expected exactly 1 call to update_from_slot(); found {update_calls} (must only occur inside run_adjustment_iteration)"
+        ));
+    }
+
+    // B) run_adjustment_iteration must call bump_check before update_from_slot.
+    let Some(iter_block) = slice_block(
+        &content,
+        "fn run_adjustment_iteration",
+        "pub fn right_left_move",
+    ) else {
+        failures.push("Adjustment policy: missing fn run_adjustment_iteration in src/operations.rs".to_string());
+        return failures;
+    };
+    let bump_pos = iter_block.find("bump_check(");
+    let update_pos = iter_block.find("update_from_slot();");
+    if bump_pos.is_none() || update_pos.is_none() {
+        failures.push(
+            "Adjustment policy: run_adjustment_iteration must contain bump_check(...) and update_from_slot();"
+                .to_string(),
+        );
+    } else if bump_pos.unwrap() > update_pos.unwrap() {
+        failures.push(
+            "Adjustment policy: run_adjustment_iteration must call bump_check(...) before update_from_slot();"
+                .to_string(),
+        );
+    }
+
+    // C) z_adjust_with_skip_and_previous must not bump_check or resample internally.
+    if let Some(zadj_block) = slice_block(
+        &content,
+        "pub fn z_adjust_with_skip_and_previous",
+        "fn run_adjustment_iteration",
+    ) {
+        if zadj_block.contains("bump_check(") {
+            failures.push("Adjustment policy: z_adjust_with_skip_and_previous must not call bump_check(...) internally".to_string());
+        }
+        if zadj_block.contains("update_from_slot(") {
+            failures.push("Adjustment policy: z_adjust_with_skip_and_previous must not call update_from_slot(...) internally".to_string());
+        }
+    } else {
+        failures.push("Adjustment policy: missing pub fn z_adjust_with_skip_and_previous in src/operations.rs".to_string());
+    }
+
+    // D) Movement algorithms must use run_adjustment_iteration (enforces order + single-sample).
+    for (name, start_pat) in [
+        ("right_left_move", "pub fn right_left_move"),
+        ("left_right_move", "pub fn left_right_move"),
+        ("z_seeker", "pub fn z_seeker"),
+    ] {
+        let Some(block) = slice_block(&content, start_pat, "\npub fn ") else {
+            failures.push(format!("Adjustment policy: missing {name} in src/operations.rs"));
+            continue;
+        };
+        if !block.contains("run_adjustment_iteration(") {
+            failures.push(format!(
+                "Adjustment policy: {name} must call run_adjustment_iteration(...) (do not sample audio directly in move loops)"
+            ));
+        }
+    }
+
+    failures
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
