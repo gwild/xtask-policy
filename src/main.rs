@@ -250,7 +250,7 @@ fn run_check() {
         }
     }
 
-    // 9) Forbidden patterns (mechanical bans: e.g., matplotlib, polling fallbacks, timeout loops)
+    // 9) Forbidden patterns (mechanical bans: e.g., matplotlib, polling defaults, timeout loops)
     if !config.patterns.forbidden_classes.is_empty() {
         // By default, scan forbidden patterns ONLY in code paths:
         // - Python: **/*.py
@@ -1304,7 +1304,7 @@ fn run_analyze(output_file: &str) {
     match fs::write(&output_path, &plan_markdown) {
         Ok(_) => {
             println!("✅ Cleanup plan written to: {}", output_path.display());
-            println!("\nSummary:");
+            println!("\nKey metrics:");
             println!("  Total violations: {}", plan.summary.total_violations);
             println!("  Files affected: {}", plan.summary.files_affected);
             if plan.summary.total_violations > 0 {
@@ -1313,6 +1313,7 @@ fn run_analyze(output_file: &str) {
                     output_path.display()
                 );
             }
+            println!("  Strategic outputs: included in the report (see \"Strategic Outputs\" section)");
         }
         Err(e) => {
             eprintln!("Failed to write cleanup plan: {e}");

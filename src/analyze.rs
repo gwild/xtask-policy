@@ -900,7 +900,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     let mut output = String::new();
 
     output.push_str("# Cleanup Plan\n\n");
-    output.push_str("## Summary\n\n");
+    output.push_str("## Key Metrics\n\n");
     output.push_str(&format!(
         "- **Total Violations**: {}\n",
         plan.summary.total_violations
@@ -957,7 +957,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     ));
 
     // Executive Summary with tables
-    output.push_str("## 📊 Executive Summary\n\n");
+    output.push_str("## 📊 Executive View\n\n");
     output.push_str("### Overall Health\n\n");
     output.push_str("| Metric | Count | Status |\n");
     output.push_str("|--------|-------|--------|\n");
@@ -1050,6 +1050,9 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         output.push('\n');
     }
 
+    // Prompt-applied output (always included)
+    output.push_str(&format_prompt_applied(plan));
+
     // FOCUS Assessment
     output.push_str("## 🎯 FOCUS Assessment\n\n");
     output.push_str("*Feedback Optimized Closed-loop Unified System*\n\n");
@@ -1065,7 +1068,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     };
     output.push_str(&format!("| **F**eedback | {} | {} |\n", feedback_status, feedback_note));
     
-    // O - Optimization: Based on fallback violations
+    // O - Optimization: Based on fail-fast violations
     let opt_status = if plan.summary.fallback_violations == 0 {
         "OK"
     } else if plan.summary.fallback_violations < 20 {
@@ -1076,7 +1079,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     let opt_note = if plan.summary.fallback_violations == 0 {
         "Fail-fast patterns enforced"
     } else {
-        &format!("{} fallback patterns need fail-fast", plan.summary.fallback_violations)
+        &format!("{} fail-fast patterns need enforcement", plan.summary.fallback_violations)
     };
     output.push_str(&format!("| **O**ptimization | {} | {} |\n", opt_status, opt_note));
     
@@ -1343,6 +1346,219 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     output.push_str("4. Commit fixes\n");
 
     output
+}
+
+fn format_prompt_applied(plan: &CleanupPlan) -> String {
+    let mut out = String::new();
+
+    // File-level counts (for concentration + targeting)
+    let mut by_file_total: HashMap<String, usize> = HashMap::new();
+    let mut by_file_fail_fast: HashMap<String, usize> = HashMap::new();
+    let mut by_file_blocking: HashMap<String, usize> = HashMap::new();
+    for v in &plan.violations {
+        *by_file_total.entry(v.file.clone()).or_insert(0) += 1;
+        match &v.violation_type {
+            ViolationType::FailFast(_) => {
+                *by_file_fail_fast.entry(v.file.clone()).or_insert(0) += 1;
+            }
+            ViolationType::BlockingLock(_) => {
+                *by_file_blocking.entry(v.file.clone()).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut files_sorted: Vec<(String, usize)> = by_file_total.into_iter().collect();
+    files_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let main_thread_dangerous = plan
+        .violations
+        .iter()
+        .filter(|v| matches!(&v.violation_type, ViolationType::BlockingLock(_)))
+        .filter(|v| v.category.as_deref() == Some("main_thread_dangerous"))
+        .count();
+
+    let poll_method_risky = plan
+        .violations
+        .iter()
+        .filter(|v| matches!(&v.violation_type, ViolationType::BlockingLock(_)))
+        .filter(|v| v.category.as_deref() == Some("poll_method_risky"))
+        .count();
+
+    let has_try_lock = plan
+        .violations
+        .iter()
+        .filter(|v| matches!(&v.violation_type, ViolationType::BlockingLock(_)))
+        .filter(|v| v.category.as_deref() == Some("has_try_lock"))
+        .count();
+
+    let unwrap_or_count = plan
+        .violations
+        .iter()
+        .filter(|v| matches!(&v.violation_type, ViolationType::FailFast(n) if n == "unwrap_or"))
+        .count();
+
+    let files_affected = plan.summary.files_affected;
+
+    let top_file = files_sorted.first().map(|(f, _)| f.as_str());
+    let top_file_short = top_file
+        .and_then(|f| f.rsplit('/').next())
+        .unwrap_or("");
+
+    out.push_str("## Strategic Outputs (Prompt-Applied)\n\n");
+
+    // 1) Strategic insights
+    out.push_str("### 1) Strategic Insights (5) — and the decision each informs\n\n");
+    if plan.violations.is_empty() {
+        out.push_str("- **Insight 1: The repo is currently clean under policy.**\n");
+        out.push_str("  **Decision it informs**: Preserve the gate—treat new violations as regressions.\n\n");
+        out.push_str("- **Insight 2: Most future risk will come from “small convenience changes”.**\n");
+        out.push_str("  **Decision it informs**: Require explicit intent for any non-fail-fast or blocking behavior.\n\n");
+        out.push_str("- **Insight 3: The highest leverage is prevention, not cleanup.**\n");
+        out.push_str("  **Decision it informs**: Keep `xtask` checks in the tightest loop (pre-merge / pre-run).\n\n");
+        out.push_str("- **Insight 4: Tooling clarity is the bottleneck once the repo is clean.**\n");
+        out.push_str("  **Decision it informs**: Keep outputs prescriptive (owners + metrics), not descriptive.\n\n");
+        out.push_str("- **Insight 5: Exceptions should remain rare and documented.**\n");
+        out.push_str("  **Decision it informs**: If an allowlist entry is added, require justification in `policy.toml` review.\n\n");
+    } else {
+        out.push_str(&format!(
+            "- **Insight 1: The violation mix is concentrated ({} file(s), {} total).**\n",
+            files_affected, plan.summary.total_violations
+        ));
+        out.push_str("  **Decision it informs**: Fix hotspots first; avoid broad repo-wide churn.\n\n");
+
+        out.push_str(&format!(
+            "- **Insight 2: Fail-fast policy dominates the risk surface ({} fail-fast violations).**\n",
+            plan.summary.fallback_violations
+        ));
+        out.push_str("  **Decision it informs**: Treat missing-required-value behavior as a contract decision: convert vs explicit allowlist.\n\n");
+
+        out.push_str(&format!(
+            "- **Insight 3: UI stability is the second-order risk ({} blocking locks; {} main-thread dangerous).**\n",
+            plan.summary.blocking_lock_violations, main_thread_dangerous
+        ));
+        out.push_str("  **Decision it informs**: Prioritize removing main-thread blocking first to prevent freezes.\n\n");
+
+        if !top_file_short.is_empty() {
+            out.push_str(&format!(
+                "- **Insight 4: One file likely anchors the quickest wins (`{}` is the largest hotspot).**\n",
+                top_file_short
+            ));
+            out.push_str("  **Decision it informs**: Start with the biggest hotspot to reduce totals fastest.\n\n");
+        } else {
+            out.push_str("- **Insight 4: Hotspots are identifiable by file-level totals.**\n");
+            out.push_str("  **Decision it informs**: Start with the top-ranked file in the hotspot table.\n\n");
+        }
+
+        out.push_str("- **Insight 5: Not every violation should be “fixed” the same way.**\n");
+        out.push_str("  **Decision it informs**: For each pattern, decide: enforce (fail-fast / non-blocking) vs narrow allowlist with justification.\n\n");
+    }
+
+    // 2) Action plan
+    out.push_str("### 2) 5-step execution plan (owners, quick wins, measurable results)\n\n");
+    if plan.violations.is_empty() {
+        out.push_str("1. **Keep the gate tight** (Owner: Repo owner)\n");
+        out.push_str("   - Quick win: Run `cargo run -p xtask -- check` before changes land.\n");
+        out.push_str("   - Metric: total violations stays at 0.\n\n");
+        out.push_str("2. **Prevent main-thread blocking regressions** (Owner: GUI maintainer)\n");
+        out.push_str("   - Quick win: Prefer non-blocking patterns in UI paths.\n");
+        out.push_str("   - Metric: main-thread blocking locks stays at 0.\n\n");
+        out.push_str("3. **Keep fail-fast strict** (Owner: Rust core maintainer)\n");
+        out.push_str("   - Quick win: refuse silent defaults for required inputs.\n");
+        out.push_str("   - Metric: fail-fast violations stays at 0.\n\n");
+        out.push_str("4. **Keep allowlists narrow** (Owner: Repo owner)\n");
+        out.push_str("   - Quick win: treat allowlists as explicit exceptions only.\n");
+        out.push_str("   - Metric: allowlist entries grow slowly and deliberately.\n\n");
+        out.push_str("5. **Re-run analyze after meaningful edits** (Owner: Repo owner)\n");
+        out.push_str("   - Quick win: keep `cleanup-plan.md` current.\n");
+        out.push_str("   - Metric: any regression shows up immediately.\n\n");
+    } else {
+        out.push_str("1. **Classify each fail-fast instance (required vs runtime-data)** (Owner: Rust core maintainer)\n");
+        out.push_str("   - Quick win: tag each hotspot instance as “convert” vs “explicit allowlist”.\n");
+        out.push_str("   - Metric: classification completed for all fail-fast violations.\n\n");
+
+        out.push_str(&format!(
+            "2. **Remove main-thread dangerous blocking** (Owner: GUI maintainer)\n   - Quick win: fix the {} `main_thread_dangerous` locks first.\n   - Metric: main-thread dangerous locks: {} → 0.\n\n",
+            main_thread_dangerous, main_thread_dangerous
+        ));
+
+        out.push_str(&format!(
+            "3. **Convert `unwrap_or` where it masks required values** (Owner: Rust core maintainer)\n   - Quick win: convert the {} `unwrap_or` sites that should be fatal.\n   - Metric: `unwrap_or` violations: {} → 0 (or explicit allowlist).\n\n",
+            unwrap_or_count, unwrap_or_count
+        ));
+
+        out.push_str(&format!(
+            "4. **Handle remaining lock-risk categories** (Owner: GUI maintainer)\n   - Quick win: address {} `poll_method_risky` + {} `has_try_lock` flagged contexts.\n   - Metric: blocking locks: {} → 0 (or minimized to justified contexts).\n\n",
+            poll_method_risky, has_try_lock, plan.summary.blocking_lock_violations
+        ));
+
+        out.push_str("5. **Re-run analyze until clean (or intentionally allowlisted)** (Owner: Repo owner)\n");
+        out.push_str(&format!(
+            "   - Quick win: iterate file-by-file starting from the top hotspot.\n   - Metric: total violations: {} → 0.\n\n",
+            plan.summary.total_violations
+        ));
+    }
+
+    // 3) Hidden assumptions
+    out.push_str("### 3) Hidden assumptions / blind spots — and what changes if they’re wrong\n\n");
+    out.push_str("- **Assumption: “runtime_data” defaults are benign.** If wrong: treat more sites as required and make them fatal.\n");
+    out.push_str("- **Assumption: Non-blocking lock patterns are acceptable in UI code paths.** If wrong: move work off-thread or restructure ownership.\n");
+    out.push_str("- **Assumption: Hotspot counts correlate with impact.** If wrong: prioritize by call-path criticality, not counts.\n\n");
+
+    // 4) Compare opposing views
+    out.push_str("### 4) Competing perspectives — where each fits\n\n");
+    out.push_str("- **Perspective A: Strict policy enforcement everywhere.** Best when missing values indicate broken invariants and must fail loudly.\n");
+    out.push_str("- **Perspective B: Narrow, explicit allowlists for intentional exceptions.** Best when missing data is expected and does not affect correctness.\n\n");
+
+    // 5) Contrarian takeaways
+    out.push_str("### 5) Contrarian takeaways (credible one-liners)\n\n");
+    if plan.violations.is_empty() {
+        out.push_str("- **The hard part isn’t cleanup; it’s keeping the repo clean under pressure.**\n");
+        out.push_str("- **Allowlist growth is a leading indicator of policy decay.**\n");
+        out.push_str("- **Tool outputs should drive decisions, not narrate problems.**\n\n");
+    } else {
+        out.push_str("- **Your fastest stability gains are likely in UI lock hygiene, not core logic rewrites.**\n");
+        out.push_str("- **One “convenience” default can silently invalidate an entire run’s correctness assumptions.**\n");
+        out.push_str("- **Fixing the biggest hotspot file first usually beats “fix one violation type everywhere”.**\n\n");
+    }
+
+    // 6) Leverage points
+    out.push_str("### 6) Leverage points (small actions, outsized results)\n\n");
+    if plan.violations.is_empty() {
+        out.push_str("- **Leverage 1: Keep `xtask` in the tight loop.** It prevents regressions from landing.\n");
+        out.push_str("- **Leverage 2: Keep UI paths non-blocking by default.** It avoids user-visible freezes.\n");
+        out.push_str("- **Leverage 3: Keep allowlists explicit and rare.** It preserves policy meaning.\n\n");
+    } else {
+        out.push_str(&format!(
+            "- **Leverage 1: Eliminate the {} main-thread dangerous locks.** It directly reduces UI freeze risk.\n",
+            main_thread_dangerous
+        ));
+        out.push_str("- **Leverage 2: Standardize fatal error paths for required values.** It prevents silent contract drift.\n");
+        out.push_str("- **Leverage 3: Use `policy.toml` sparingly but explicitly.** It prevents churn and keeps exceptions reviewable.\n\n");
+    }
+
+    // 7) Target list (practical)
+    out.push_str("### 7) Where to start (top hotspots)\n\n");
+    if plan.violations.is_empty() {
+        out.push_str("- No hotspots (0 violations).\n\n");
+        return out;
+    }
+    for (idx, (file, total)) in files_sorted.iter().take(5).enumerate() {
+        let fb = by_file_fail_fast.get(file).copied().unwrap_or(0);
+        let bl = by_file_blocking.get(file).copied().unwrap_or(0);
+        let short = file.rsplit('/').next().unwrap_or(file);
+        out.push_str(&format!(
+            "{}. `{}` — total: {}, fail-fast: {}, blocking locks: {}\n",
+            idx + 1,
+            short,
+            total,
+            fb,
+            bl
+        ));
+    }
+    out.push('\n');
+
+    out
 }
 
 fn required_config_violations(config: &PolicyConfig, scan_root: &Path) -> Vec<Violation> {

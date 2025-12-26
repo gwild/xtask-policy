@@ -36,7 +36,7 @@ pub fn repo_context() -> Result<RepoContext, String> {
         cur = dir.parent();
     }
 
-    // 2) Fallback: submodule layout (xtask/policy.toml) for standalone testing
+    // 2) Alternate: submodule layout (xtask/policy.toml) for standalone testing
     let mut cur: Option<&Path> = Some(&start);
     while let Some(dir) = cur {
         let candidate = dir.join("xtask").join("policy.toml");
