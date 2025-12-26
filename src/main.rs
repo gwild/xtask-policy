@@ -305,6 +305,9 @@ fn run_check() {
     // 12) Prescriptive adjustment-process invariants (stringdriver control loop)
     failures.extend(check_adjustment_process_policy(&ctx.scan_root));
 
+    // 13) NO CACHE: GUI/SSOT values must not be cached before loop iterations (must be re-read inside loops).
+    failures.extend(check_no_gui_value_cache_before_loops(&ctx.scan_root));
+
     if failures.is_empty() {
         println!("policy: OK");
         return;
@@ -405,6 +408,237 @@ fn check_adjustment_process_policy(scan_root: &Path) -> Vec<String> {
             failures.push(format!(
                 "Adjustment policy: {name} must call run_adjustment_iteration(...) (do not sample audio directly in move loops)"
             ));
+        }
+    }
+
+    // E) SSOT/JIT: no getter layer in movement algorithms + no cached step sizes.
+    // We require each move to compute `(*self.x_step.lock().unwrap()).abs()` immediately before calling rel_move_x.
+    for (name, start_pat) in [
+        ("right_left_move", "pub fn right_left_move"),
+        ("left_right_move", "pub fn left_right_move"),
+        ("z_seeker", "pub fn z_seeker"),
+    ] {
+        let Some(block) = slice_block(&content, start_pat, "\npub fn ") else {
+            continue;
+        };
+
+        if block.contains("self.get_") {
+            failures.push(format!(
+                "Adjustment policy: {name} must not use self.get_*() (no getter layer; read SSOT fields directly JIT)"
+            ));
+        }
+
+        // Additionally, every rel_move_x(...) within these algorithms must have a nearby JIT read of x_step.
+        // This is a coarse but effective “no cache” check: if a rel_move_x happens without a nearby
+        // x_step.lock().unwrap(), it likely used a cached step size.
+        let mut search_from = 0usize;
+        while let Some(rel_pos) = block[search_from..].find("rel_move_x(") {
+            let rel_abs = search_from + rel_pos;
+            let window_start = rel_abs.saturating_sub(800);
+            let window = &block[window_start..rel_abs];
+            if !window.contains("x_step.lock") {
+                failures.push(format!(
+                    "Adjustment policy: {name} calls rel_move_x(...) without a nearby self.x_step.lock().unwrap() JIT read (no cached step sizes allowed)"
+                ));
+                break;
+            }
+            search_from = rel_abs + "rel_move_x(".len();
+        }
+    }
+
+    failures
+}
+
+fn check_no_gui_value_cache_before_loops(scan_root: &Path) -> Vec<String> {
+    let mut failures = vec![];
+
+    fn walk_rs_files(root: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_rs_files(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    // Scan only runtime code (not target/, not docs).
+    let mut files: Vec<std::path::PathBuf> = vec![];
+    walk_rs_files(&scan_root.join("src"), &mut files);
+
+    // Detect the “GUI/SSOT cache” bug class:
+    // - Read a GUI-tunable value into a local before a loop starts
+    // - Then use that local inside the loop while the GUI can update the SSOT mid-run.
+    //
+    // Policy: In any function containing a loop, any `let <ident> = <ssot_read>` before the
+    // first loop keyword is a violation IF `<ident>` is used after the loop begins.
+    //
+    // We support both patterns:
+    // - getter layer (legacy): self.get_*(), ops_guard.get_*()
+    // - direct SSOT reads (preferred): *self.<field>.lock().unwrap()
+    let gui_fields = [
+        "bump_check_enable",
+        "z_up_step",
+        "z_down_step",
+        "tune_rest",
+        "x_rest",
+        "z_rest",
+        "lap_rest",
+        "adjustment_level",
+        "retry_threshold",
+        "delta_threshold",
+        "z_variance_threshold",
+        "x_start",
+        "x_finish",
+        "x_step",
+        "z_min",
+        "z_max",
+        "max_bump_check_iterations",
+    ];
+    let loop_markers = ["loop {", "while ", "for "];
+
+    fn contains_ident(hay: &str, ident: &str) -> bool {
+        let bytes = hay.as_bytes();
+        let ident_b = ident.as_bytes();
+        if ident_b.is_empty() {
+            return false;
+        }
+        let mut i = 0usize;
+        while i + ident_b.len() <= bytes.len() {
+            if &bytes[i..i + ident_b.len()] == ident_b {
+                let prev_ok = i == 0
+                    || !matches!(bytes[i - 1] as char, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_');
+                let next_i = i + ident_b.len();
+                let next_ok = next_i == bytes.len()
+                    || !matches!(bytes[next_i] as char, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_');
+                if prev_ok && next_ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn let_bound_ident(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        if !t.starts_with("let ") {
+            return None;
+        }
+        let t = &t["let ".len()..];
+        let t = t.trim_start();
+        let t = if t.starts_with("mut ") { &t["mut ".len()..] } else { t };
+        let mut ident = String::new();
+        for c in t.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                ident.push(c);
+            } else {
+                break;
+            }
+        }
+        if ident.is_empty() { None } else { Some(ident) }
+    }
+
+    fn is_gui_read_line(line: &str, gui_fields: &[&str]) -> bool {
+        let gui_getters = [
+            "get_bump_check_enable",
+            "get_z_up_step",
+            "get_z_down_step",
+            "get_tune_rest",
+            "get_x_rest",
+            "get_z_rest",
+            "get_lap_rest",
+            "get_adjustment_level",
+            "get_retry_threshold",
+            "get_delta_threshold",
+            "get_z_variance_threshold",
+            "get_x_start",
+            "get_x_finish",
+            "get_x_step",
+            "get_z_min",
+            "get_z_max",
+            "get_max_bump_check_iterations",
+        ];
+        if gui_getters.iter().any(|g| line.contains(g)) {
+            return true;
+        }
+        // Direct field lock reads in Operations impl
+        for f in gui_fields {
+            if line.contains(&format!("self.{f}.lock")) || line.contains(&format!("ops_guard.{f}.lock")) {
+                return true;
+            }
+        }
+        false
+    }
+
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel_path = file
+            .strip_prefix(scan_root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+
+        // Find function boundaries by line starts (simple but effective for this repo).
+        let lines: Vec<&str> = content.lines().collect();
+        let mut fn_starts: Vec<usize> = vec![];
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("fn ") || t.starts_with("pub fn ") {
+                fn_starts.push(i);
+            }
+        }
+        fn_starts.push(lines.len());
+
+        for w in fn_starts.windows(2) {
+            let start = w[0];
+            let end = w[1];
+            if start >= end || end > lines.len() {
+                continue;
+            }
+
+            // Find the first loop keyword inside this function block.
+            let mut first_loop: Option<usize> = None;
+            for i in start..end {
+                let t = lines[i].trim_start();
+                if loop_markers.iter().any(|m| t.starts_with(m)) {
+                    first_loop = Some(i);
+                    break;
+                }
+            }
+            let Some(loop_line) = first_loop else {
+                continue; // no loop => no iteration caching issue
+            };
+
+            let rest = lines[loop_line..end].join("\n");
+
+            // Flag any GUI/SSOT value cached before the first loop line AND used after loop start.
+            for i in start..loop_line {
+                let line = lines[i];
+                if !line.contains("let ") || !line.contains(" = ") {
+                    continue;
+                }
+                if !is_gui_read_line(line, &gui_fields) {
+                    continue;
+                }
+                let Some(ident) = let_bound_ident(line) else {
+                    continue;
+                };
+                if contains_ident(&rest, &ident) {
+                    failures.push(format!(
+                        "SSOT cache (gui) across loop: {rel_path}:{}: {line}",
+                        i + 1
+                    ));
+                }
+            }
         }
     }
 

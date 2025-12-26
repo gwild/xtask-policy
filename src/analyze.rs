@@ -29,6 +29,7 @@ pub enum ViolationType {
     Hardcode(String),
     Style(String),
     BlockingLock(String), // blocking lock in dangerous path (e.g., GUI thread)
+    NoCache,              // GUI/SSOT value cached before a loop iteration begins
 }
 
 #[derive(Debug)]
@@ -43,7 +44,14 @@ pub struct PlanSummary {
     pub total_violations: usize,
     pub lock_violations: usize,
     pub spawn_violations: usize,
+    // SSOT violations include:
+    // - leakage: SSOT owner types referenced outside allowlist (ViolationType::Ssot)
+    // - caching: GUI/SSOT values cached before loops (ViolationType::NoCache)
     pub ssot_violations: usize,
+    pub ssot_leakage_violations: usize,
+    pub ssot_cache_violations: usize,
+    pub ssot_cache_gui_violations: usize,
+    pub ssot_cache_non_gui_violations: usize,
     pub fallback_violations: usize,
     pub required_config_violations: usize,
     pub sensitive_violations: usize,
@@ -280,6 +288,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         }
     }
 
+    // Scan for "NO CACHE before loop" (GUI-tunable SSOT values cached before iteration begins)
+    // NOTE: This is not a regex class; it's a code-level policy check (same bug class as cached x_step).
+    violations.extend(no_cache_before_loop_violations(scan_root));
+
     // Generate summary
     let lock_violations = violations
         .iter()
@@ -289,7 +301,7 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Spawn))
         .count();
-    let ssot_violations = violations
+    let ssot_leakage_violations = violations
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Ssot(_)))
         .count();
@@ -317,6 +329,22 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::BlockingLock(_)))
         .count();
+    let ssot_cache_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::NoCache))
+        .count();
+    let ssot_cache_gui_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::NoCache))
+        .filter(|v| v.category.as_deref() == Some("gui"))
+        .count();
+    let ssot_cache_non_gui_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::NoCache))
+        .filter(|v| v.category.as_deref() == Some("non_gui"))
+        .count();
+
+    let ssot_violations = ssot_leakage_violations + ssot_cache_violations;
 
     let mut files_affected = std::collections::HashSet::new();
     for v in &violations {
@@ -328,6 +356,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         lock_violations,
         spawn_violations,
         ssot_violations,
+        ssot_leakage_violations,
+        ssot_cache_violations,
+        ssot_cache_gui_violations,
+        ssot_cache_non_gui_violations,
         fallback_violations: fail_fast_violations,
         required_config_violations,
         sensitive_violations,
@@ -406,6 +438,195 @@ fn scan_pattern(
     }
 
     Ok(results)
+}
+
+fn no_cache_before_loop_violations(scan_root: &Path) -> Vec<Violation> {
+    // This is the same bug class as cached x_step: GUI-tunable values read once into locals,
+    // then used inside a loop while the GUI can update them mid-run.
+    //
+    // Policy: in any function containing a loop, any `let <ident> = <ssot_read>` before the first
+    // loop keyword is a violation IF `<ident>` is used after the loop begins.
+
+    fn walk_rs_files(root: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_rs_files(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files: Vec<std::path::PathBuf> = vec![];
+    walk_rs_files(&scan_root.join("src"), &mut files);
+
+    let gui_fields = [
+        "bump_check_enable",
+        "z_up_step",
+        "z_down_step",
+        "tune_rest",
+        "x_rest",
+        "z_rest",
+        "lap_rest",
+        "adjustment_level",
+        "retry_threshold",
+        "delta_threshold",
+        "z_variance_threshold",
+        "x_start",
+        "x_finish",
+        "x_step",
+        "z_min",
+        "z_max",
+        "max_bump_check_iterations",
+    ];
+    let loop_markers = ["loop {", "while ", "for "];
+
+    fn contains_ident(hay: &str, ident: &str) -> bool {
+        let bytes = hay.as_bytes();
+        let ident_b = ident.as_bytes();
+        if ident_b.is_empty() {
+            return false;
+        }
+        let mut i = 0usize;
+        while i + ident_b.len() <= bytes.len() {
+            if &bytes[i..i + ident_b.len()] == ident_b {
+                let prev_ok = i == 0
+                    || !matches!(bytes[i - 1] as char, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_');
+                let next_i = i + ident_b.len();
+                let next_ok = next_i == bytes.len()
+                    || !matches!(bytes[next_i] as char, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_');
+                if prev_ok && next_ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn let_bound_ident(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        if !t.starts_with("let ") {
+            return None;
+        }
+        let t = &t["let ".len()..];
+        let t = t.trim_start();
+        let t = if t.starts_with("mut ") { &t["mut ".len()..] } else { t };
+        let mut ident = String::new();
+        for c in t.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                ident.push(c);
+            } else {
+                break;
+            }
+        }
+        if ident.is_empty() { None } else { Some(ident) }
+    }
+
+    fn is_gui_read_line(line: &str, gui_fields: &[&str]) -> Option<String> {
+        let gui_getters = [
+            "get_bump_check_enable",
+            "get_z_up_step",
+            "get_z_down_step",
+            "get_tune_rest",
+            "get_x_rest",
+            "get_z_rest",
+            "get_lap_rest",
+            "get_adjustment_level",
+            "get_retry_threshold",
+            "get_delta_threshold",
+            "get_z_variance_threshold",
+            "get_x_start",
+            "get_x_finish",
+            "get_x_step",
+            "get_z_min",
+            "get_z_max",
+            "get_max_bump_check_iterations",
+        ];
+        if gui_getters.iter().any(|g| line.contains(g)) {
+            return Some("gui".to_string());
+        }
+        for f in gui_fields {
+            if line.contains(&format!("self.{f}.lock")) || line.contains(&format!("ops_guard.{f}.lock")) {
+                return Some("gui".to_string());
+            }
+        }
+        None
+    }
+
+    let mut out: Vec<Violation> = vec![];
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel_path = file
+            .strip_prefix(scan_root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+
+        let lines: Vec<&str> = content.lines().collect();
+        let mut fn_starts: Vec<usize> = vec![];
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("fn ") || t.starts_with("pub fn ") {
+                fn_starts.push(i);
+            }
+        }
+        fn_starts.push(lines.len());
+
+        for w in fn_starts.windows(2) {
+            let start = w[0];
+            let end = w[1];
+            if start >= end || end > lines.len() {
+                continue;
+            }
+
+            let mut first_loop: Option<usize> = None;
+            for i in start..end {
+                let t = lines[i].trim_start();
+                if loop_markers.iter().any(|m| t.starts_with(m)) {
+                    first_loop = Some(i);
+                    break;
+                }
+            }
+            let Some(loop_line) = first_loop else {
+                continue;
+            };
+
+            let rest = lines[loop_line..end].join("\n");
+            for i in start..loop_line {
+                let line = lines[i];
+                if !line.contains("let ") || !line.contains(" = ") {
+                    continue;
+                }
+                let Some(category) = is_gui_read_line(line, &gui_fields) else {
+                    continue;
+                };
+                let Some(ident) = let_bound_ident(line) else {
+                    continue;
+                };
+                if contains_ident(&rest, &ident) {
+                    out.push(Violation {
+                        rule: "NO CACHE before loop".to_string(),
+                        file: rel_path.clone(),
+                        line: format!("{}: {line}", i + 1),
+                        pattern: "let <ident> = <ssot_read> before first loop, used after loop begins".to_string(),
+                        violation_type: ViolationType::NoCache,
+                        category: Some(category),
+                    });
+                }
+            }
+        }
+    }
+
+    out
 }
 
 fn is_allowed(path: &str, allow_prefixes: &[String]) -> bool {
@@ -697,6 +918,16 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         plan.summary.ssot_violations
     ));
     output.push_str(&format!(
+        "  - **SSOT leakage**: {}\n",
+        plan.summary.ssot_leakage_violations
+    ));
+    output.push_str(&format!(
+        "  - **SSOT cache**: {} (gui: {}, non-gui: {})\n",
+        plan.summary.ssot_cache_violations,
+        plan.summary.ssot_cache_gui_violations,
+        plan.summary.ssot_cache_non_gui_violations
+    ));
+    output.push_str(&format!(
         "- **Fallback Violations**: {}\n",
         plan.summary.fallback_violations
     ));
@@ -761,6 +992,12 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             plan.summary.blocking_lock_violations
         ));
     }
+    if plan.summary.ssot_cache_violations > 0 {
+        output.push_str(&format!(
+            "| **SSOT cache** (GUI values cached before loops) | {} | 🔴 High |\n",
+            plan.summary.ssot_cache_violations
+        ));
+    }
     let clean_count = plan.summary.lock_violations
         + plan.summary.spawn_violations
         + plan.summary.ssot_violations
@@ -768,7 +1005,11 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         + plan.summary.sensitive_violations
         + plan.summary.hardcode_violations
         + plan.summary.style_violations;
-    if clean_count == 0 && (plan.summary.fallback_violations > 0 || plan.summary.blocking_lock_violations > 0) {
+    if clean_count == 0
+        && (plan.summary.fallback_violations > 0
+            || plan.summary.blocking_lock_violations > 0
+            || plan.summary.ssot_cache_violations > 0)
+    {
         output.push_str("| Lock/Spawn/SSOT/Config | 0 | 🟢 Clean |\n");
     }
     output.push('\n');
@@ -1080,6 +1321,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::Hardcode(name) => name,
             ViolationType::Style(name) => name,
             ViolationType::BlockingLock(name) => name,
+            ViolationType::NoCache => "NoCache",
         };
         let category = match &v.category {
             Some(s) => s.as_str(),
