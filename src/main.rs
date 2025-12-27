@@ -1393,6 +1393,7 @@ fn log_analyze_to_db(
     let output_path_str = output_path.to_string_lossy().to_string();
 
     let hotspots = analyze::top_hotspots(plan, 5);
+    let by_file = analyze::file_breakdown(plan);
     let mut hotspot_cols: Vec<Option<String>> = vec![];
     for h in &hotspots {
         hotspot_cols.push(Some(format!(
@@ -1428,7 +1429,8 @@ fn log_analyze_to_db(
             "blocking_lock_violations": plan.summary.blocking_lock_violations,
             "files_affected": plan.summary.files_affected
         },
-        "top_hotspots": hotspots
+        "top_hotspots": hotspots,
+        "by_file": by_file
     });
 
     let host = match std::env::var("HOSTNAME") {

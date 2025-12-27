@@ -48,9 +48,22 @@ pub struct HotspotEntry {
     pub blocking_locks: usize,
 }
 
+pub fn file_breakdown(plan: &CleanupPlan) -> Vec<HotspotEntry> {
+    file_breakdown_internal(plan, None)
+}
+
 pub fn top_hotspots(plan: &CleanupPlan, n: usize) -> Vec<HotspotEntry> {
-    if plan.violations.is_empty() || n == 0 {
+    file_breakdown_internal(plan, Some(n))
+}
+
+fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<HotspotEntry> {
+    if plan.violations.is_empty() {
         return vec![];
+    }
+    if let Some(n) = limit {
+        if n == 0 {
+            return vec![];
+        }
     }
 
     let mut by_file_total: HashMap<&str, usize> = HashMap::new();
@@ -77,7 +90,11 @@ pub fn top_hotspots(plan: &CleanupPlan, n: usize) -> Vec<HotspotEntry> {
     files_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
     let mut out: Vec<HotspotEntry> = vec![];
-    for (file, total) in files_sorted.into_iter().take(n) {
+    let iter: Box<dyn Iterator<Item = (&str, usize)>> = match limit {
+        Some(n) => Box::new(files_sorted.into_iter().take(n)),
+        None => Box::new(files_sorted.into_iter()),
+    };
+    for (file, total) in iter {
         let fail_fast = match by_file_fail_fast.get(file) {
             Some(v) => *v,
             None => 0,
