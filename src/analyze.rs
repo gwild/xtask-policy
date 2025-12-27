@@ -44,8 +44,17 @@ pub struct CleanupPlan {
 pub struct HotspotEntry {
     pub file: String,
     pub total: usize,
-    pub fail_fast: usize,
-    pub blocking_locks: usize,
+    // Per-file breakdown for all key metrics, so plotting GUIs can share the same legend
+    // between time-series and per-file stacked bars.
+    pub lock_violations: usize,
+    pub spawn_violations: usize,
+    pub ssot_violations: usize,
+    pub fallback_violations: usize,
+    pub required_config_violations: usize,
+    pub sensitive_violations: usize,
+    pub hardcode_violations: usize,
+    pub style_violations: usize,
+    pub blocking_lock_violations: usize,
 }
 
 pub fn file_breakdown(plan: &CleanupPlan) -> Vec<HotspotEntry> {
@@ -67,19 +76,46 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
     }
 
     let mut by_file_total: HashMap<&str, usize> = HashMap::new();
-    let mut by_file_fail_fast: HashMap<&str, usize> = HashMap::new();
-    let mut by_file_blocking: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_lock: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_spawn: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_ssot: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_fallback: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_required_config: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_sensitive: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_hardcode: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_style: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_blocking_lock: HashMap<&str, usize> = HashMap::new();
 
     for v in &plan.violations {
         *by_file_total.entry(v.file.as_str()).or_insert(0) += 1;
         match &v.violation_type {
+            ViolationType::Lock => {
+                *by_file_lock.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::Spawn => {
+                *by_file_spawn.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::Ssot(_) | ViolationType::NoCache => {
+                *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
+            }
             ViolationType::FailFast(_) => {
-                *by_file_fail_fast.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_fallback.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::RequiredConfig => {
+                *by_file_required_config.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::Sensitive(_) => {
+                *by_file_sensitive.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::Hardcode(_) => {
+                *by_file_hardcode.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::Style(_) => {
+                *by_file_style.entry(v.file.as_str()).or_insert(0) += 1;
             }
             ViolationType::BlockingLock(_) => {
-                *by_file_blocking.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_blocking_lock.entry(v.file.as_str()).or_insert(0) += 1;
             }
-            _ => {}
         }
     }
 
@@ -95,19 +131,54 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
         None => Box::new(files_sorted.into_iter()),
     };
     for (file, total) in iter {
-        let fail_fast = match by_file_fail_fast.get(file) {
+        let lock_violations = match by_file_lock.get(file) {
             Some(v) => *v,
             None => 0,
         };
-        let blocking_locks = match by_file_blocking.get(file) {
+        let spawn_violations = match by_file_spawn.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let ssot_violations = match by_file_ssot.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let fallback_violations = match by_file_fallback.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let required_config_violations = match by_file_required_config.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let sensitive_violations = match by_file_sensitive.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let hardcode_violations = match by_file_hardcode.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let style_violations = match by_file_style.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let blocking_lock_violations = match by_file_blocking_lock.get(file) {
             Some(v) => *v,
             None => 0,
         };
         out.push(HotspotEntry {
             file: file.to_string(),
             total,
-            fail_fast,
-            blocking_locks,
+            lock_violations,
+            spawn_violations,
+            ssot_violations,
+            fallback_violations,
+            required_config_violations,
+            sensitive_violations,
+            hardcode_violations,
+            style_violations,
+            blocking_lock_violations,
         });
     }
     out
@@ -349,6 +420,12 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
                 if is_dangerous {
                     // Additional context check: is this in a spawned thread or main thread?
                     let category = classify_blocking_lock(&classify_ctx, scan_root, &file, &line);
+                    // Policy: we only treat blocking locks as violations when they can block UI paths.
+                    // A blocking lock inside a spawned worker thread is not a GUI-freeze risk by itself
+                    // (and is often required for executor serialization).
+                    if category == "spawned_thread" || category == "logger_thread" {
+                        continue;
+                    }
                     violations.push(Violation {
                         rule: format!("Blocking lock ({}) in GUI/main thread path", class.name),
                         file: file.clone(),

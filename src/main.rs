@@ -30,9 +30,6 @@ enum Commands {
         /// Postgres URL used to log analysis runs (if omitted, uses XTASK_ANALYSIS_DB_URL)
         #[arg(long)]
         db_url: Option<String>,
-        /// Skip DB logging for this run (explicit opt-out)
-        #[arg(long)]
-        no_db: bool,
     },
     /// Update legacy manifest (explicit permission step for editing legacy/)
     UpdateLegacyManifest,
@@ -45,8 +42,8 @@ fn main() {
         Commands::Check => {
             run_check();
         }
-        Commands::Analyze { output, db_url, no_db } => {
-            run_analyze(&output, db_url.as_deref(), no_db);
+        Commands::Analyze { output, db_url } => {
+            run_analyze(&output, db_url.as_deref());
         }
         Commands::UpdateLegacyManifest => {
             run_update_legacy_manifest();
@@ -314,6 +311,10 @@ fn run_check() {
 
     // 13) NO CACHE: GUI/SSOT values must not be cached before loop iterations (must be re-read inside loops).
     failures.extend(check_no_gui_value_cache_before_loops(&ctx.scan_root));
+
+    // 14) GUI non-blocking IPC architecture: StepperGUI socket listener must not execute mutating commands
+    // while holding the StepperGUI mutex. Mutating commands must go through a FILO/LIFO command stack.
+    failures.extend(check_stepper_gui_ipc_command_stack(&ctx.scan_root));
 
     if failures.is_empty() {
         println!("policy: OK");
@@ -647,6 +648,36 @@ fn check_no_gui_value_cache_before_loops(scan_root: &Path) -> Vec<String> {
                 }
             }
         }
+    }
+
+    failures
+}
+
+fn check_stepper_gui_ipc_command_stack(scan_root: &Path) -> Vec<String> {
+    let mut failures = vec![];
+    let path = scan_root.join("src/gui/stepper_gui.rs");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            failures.push(format!(
+                "Command stack policy: failed to read {}: {e}",
+                path.display()
+            ));
+            return failures;
+        }
+    };
+
+    // Forbidden: executing IPC mutating commands directly while holding app_clone.lock().
+    // This is the historical freeze root cause in MasterGUI: socket thread holds StepperGUI mutex and sleeps/IO happens inside handle_command call graph.
+    if content.contains("if let Ok(mut guard) = app_clone.lock()")
+        && content.contains("guard.handle_command(trimmed")
+    {
+        failures.push("Command stack policy: stepper_gui IPC must not call guard.handle_command(...) under app_clone.lock(); enqueue to command stack instead (FILO).".to_string());
+    }
+
+    // Required: presence of a FILO stack type for mutating commands (enforce architecture, not just try_lock).
+    if !content.contains("IpcQueuedCommand") || !content.contains("command_stack") {
+        failures.push("Command stack policy: stepper_gui must define an IPC FILO command stack (IpcQueuedCommand + command_stack) and execute commands in a worker thread.".to_string());
     }
 
     failures
@@ -1269,7 +1300,7 @@ fn yaml_path_non_null(root: &serde_yaml::Value, path: &str, all: bool) -> Result
     }
 }
 
-fn run_analyze(output_file: &str, db_url_arg: Option<&str>, no_db: bool) {
+fn run_analyze(output_file: &str, db_url_arg: Option<&str>) {
     let ctx = match config::repo_context() {
         Ok(c) => c,
         Err(e) => {
@@ -1322,10 +1353,6 @@ fn run_analyze(output_file: &str, db_url_arg: Option<&str>, no_db: bool) {
             }
             println!("  Strategic outputs: included in the report (see \"Strategic Outputs\" section)");
 
-            if no_db {
-                return;
-            }
-
             let resolved_db_url = match db_url_arg {
                 Some(v) => v.to_string(),
                 None => {
@@ -1338,7 +1365,7 @@ fn run_analyze(output_file: &str, db_url_arg: Option<&str>, no_db: bool) {
                             v
                         }
                         Err(_) => {
-                            eprintln!("FATAL: XTASK_ANALYSIS_DB_URL not configured and --db-url not provided (required to log analyze runs). Use --no-db to skip logging explicitly.");
+                            eprintln!("FATAL: XTASK_ANALYSIS_DB_URL not configured and --db-url not provided (required to log analyze runs).");
                             std::process::exit(1);
                         }
                     }
@@ -1397,8 +1424,8 @@ fn log_analyze_to_db(
     let mut hotspot_cols: Vec<Option<String>> = vec![];
     for h in &hotspots {
         hotspot_cols.push(Some(format!(
-            "{}|total:{}|fail_fast:{}|blocking_locks:{}",
-            h.file, h.total, h.fail_fast, h.blocking_locks
+            "{}|total:{}|fallback_violations:{}|blocking_lock_violations:{}",
+            h.file, h.total, h.fallback_violations, h.blocking_lock_violations
         )));
     }
     while hotspot_cols.len() < 5 {
