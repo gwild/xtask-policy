@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path, process::Command};
 
 use crate::config::PolicyConfig;
+use serde::Serialize;
 
 struct ClassifyContext {
     env: HashMap<String, String>,
@@ -37,6 +38,62 @@ pub struct CleanupPlan {
     pub violations: Vec<Violation>,
     pub summary: PlanSummary,
     pub recommendations: Vec<Recommendation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HotspotEntry {
+    pub file: String,
+    pub total: usize,
+    pub fail_fast: usize,
+    pub blocking_locks: usize,
+}
+
+pub fn top_hotspots(plan: &CleanupPlan, n: usize) -> Vec<HotspotEntry> {
+    if plan.violations.is_empty() || n == 0 {
+        return vec![];
+    }
+
+    let mut by_file_total: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_fail_fast: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_blocking: HashMap<&str, usize> = HashMap::new();
+
+    for v in &plan.violations {
+        *by_file_total.entry(v.file.as_str()).or_insert(0) += 1;
+        match &v.violation_type {
+            ViolationType::FailFast(_) => {
+                *by_file_fail_fast.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::BlockingLock(_) => {
+                *by_file_blocking.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut files_sorted: Vec<(&str, usize)> = by_file_total
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    files_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut out: Vec<HotspotEntry> = vec![];
+    for (file, total) in files_sorted.into_iter().take(n) {
+        let fail_fast = match by_file_fail_fast.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let blocking_locks = match by_file_blocking.get(file) {
+            Some(v) => *v,
+            None => 0,
+        };
+        out.push(HotspotEntry {
+            file: file.to_string(),
+            total,
+            fail_fast,
+            blocking_locks,
+        });
+    }
+    out
 }
 
 #[derive(Debug)]

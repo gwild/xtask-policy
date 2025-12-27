@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 
 #[derive(Parser)]
@@ -26,6 +27,12 @@ enum Commands {
         /// Output file for cleanup plan (default: cleanup-plan.md)
         #[arg(short, long, default_value = "cleanup-plan.md")]
         output: String,
+        /// Postgres URL used to log analysis runs (if omitted, uses XTASK_ANALYSIS_DB_URL)
+        #[arg(long)]
+        db_url: Option<String>,
+        /// Skip DB logging for this run (explicit opt-out)
+        #[arg(long)]
+        no_db: bool,
     },
     /// Update legacy manifest (explicit permission step for editing legacy/)
     UpdateLegacyManifest,
@@ -38,8 +45,8 @@ fn main() {
         Commands::Check => {
             run_check();
         }
-        Commands::Analyze { output } => {
-            run_analyze(&output);
+        Commands::Analyze { output, db_url, no_db } => {
+            run_analyze(&output, db_url.as_deref(), no_db);
         }
         Commands::UpdateLegacyManifest => {
             run_update_legacy_manifest();
@@ -1262,7 +1269,7 @@ fn yaml_path_non_null(root: &serde_yaml::Value, path: &str, all: bool) -> Result
     }
 }
 
-fn run_analyze(output_file: &str) {
+fn run_analyze(output_file: &str, db_url_arg: Option<&str>, no_db: bool) {
     let ctx = match config::repo_context() {
         Ok(c) => c,
         Err(e) => {
@@ -1314,12 +1321,195 @@ fn run_analyze(output_file: &str) {
                 );
             }
             println!("  Strategic outputs: included in the report (see \"Strategic Outputs\" section)");
+
+            if no_db {
+                return;
+            }
+
+            let resolved_db_url = match db_url_arg {
+                Some(v) => v.to_string(),
+                None => {
+                    match std::env::var("XTASK_ANALYSIS_DB_URL") {
+                        Ok(v) => {
+                            if v.trim().is_empty() {
+                                eprintln!("FATAL: XTASK_ANALYSIS_DB_URL is empty (required to log analyze runs). Use --no-db to skip logging explicitly.");
+                                std::process::exit(1);
+                            }
+                            v
+                        }
+                        Err(_) => {
+                            eprintln!("FATAL: XTASK_ANALYSIS_DB_URL not configured and --db-url not provided (required to log analyze runs). Use --no-db to skip logging explicitly.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
+            if let Err(e) = log_analyze_to_db(
+                &resolved_db_url,
+                &ctx,
+                output_file,
+                &output_path,
+                &plan,
+                &plan_markdown,
+            ) {
+                eprintln!("FATAL: failed to log analyze run to DB: {e}");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("Failed to write cleanup plan: {e}");
             std::process::exit(1);
         }
     }
+}
+
+fn sha256_hex_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn sha256_hex_str(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn log_analyze_to_db(
+    db_url: &str,
+    ctx: &config::RepoContext,
+    output_arg: &str,
+    output_path: &Path,
+    plan: &analyze::CleanupPlan,
+    plan_markdown: &str,
+) -> Result<(), String> {
+    let policy_sha256 = sha256_hex_file(&ctx.policy_path)?;
+    let report_sha256 = sha256_hex_str(plan_markdown);
+
+    let scan_root_str = ctx.scan_root.to_string_lossy().to_string();
+    let policy_path_str = ctx.policy_path.to_string_lossy().to_string();
+    let output_path_str = output_path.to_string_lossy().to_string();
+
+    let hotspots = analyze::top_hotspots(plan, 5);
+    let mut hotspot_cols: Vec<Option<String>> = vec![];
+    for h in &hotspots {
+        hotspot_cols.push(Some(format!(
+            "{}|total:{}|fail_fast:{}|blocking_locks:{}",
+            h.file, h.total, h.fail_fast, h.blocking_locks
+        )));
+    }
+    while hotspot_cols.len() < 5 {
+        hotspot_cols.push(None);
+    }
+
+    let payload = serde_json::json!({
+        "scan_root": scan_root_str,
+        "policy_path": policy_path_str,
+        "policy_sha256": policy_sha256,
+        "output_arg": output_arg,
+        "output_path": output_path_str,
+        "output_sha256": report_sha256,
+        "summary": {
+            "total_violations": plan.summary.total_violations,
+            "lock_violations": plan.summary.lock_violations,
+            "spawn_violations": plan.summary.spawn_violations,
+            "ssot_violations": plan.summary.ssot_violations,
+            "ssot_leakage_violations": plan.summary.ssot_leakage_violations,
+            "ssot_cache_violations": plan.summary.ssot_cache_violations,
+            "ssot_cache_gui_violations": plan.summary.ssot_cache_gui_violations,
+            "ssot_cache_non_gui_violations": plan.summary.ssot_cache_non_gui_violations,
+            "fallback_violations": plan.summary.fallback_violations,
+            "required_config_violations": plan.summary.required_config_violations,
+            "sensitive_violations": plan.summary.sensitive_violations,
+            "hardcode_violations": plan.summary.hardcode_violations,
+            "style_violations": plan.summary.style_violations,
+            "blocking_lock_violations": plan.summary.blocking_lock_violations,
+            "files_affected": plan.summary.files_affected
+        },
+        "top_hotspots": hotspots
+    });
+
+    let host = match std::env::var("HOSTNAME") {
+        Ok(v) => v,
+        Err(_) => "unknown".to_string(),
+    };
+    let xtask_version = env!("CARGO_PKG_VERSION").to_string();
+
+    let mut client = Client::connect(db_url, NoTls).map_err(|e| format!("connect failed: {e}"))?;
+
+    client
+        .execute(
+            r#"
+INSERT INTO analysis (
+  host,
+  xtask_version,
+  scan_root,
+  policy_path,
+  policy_sha256,
+  output_arg,
+  output_path,
+  output_sha256,
+  total_violations,
+  lock_violations,
+  spawn_violations,
+  ssot_violations,
+  fallback_violations,
+  required_config_violations,
+  sensitive_violations,
+  hardcode_violations,
+  style_violations,
+  blocking_lock_violations,
+  files_affected,
+  hotspot_1,
+  hotspot_2,
+  hotspot_3,
+  hotspot_4,
+  hotspot_5,
+  report_md,
+  payload_json
+)
+VALUES (
+  $1,$2,$3,$4,$5,$6,$7,$8,
+  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+  $20,$21,$22,$23,$24,
+  $25,$26
+)
+"#,
+            &[
+                &host,
+                &xtask_version,
+                &scan_root_str,
+                &policy_path_str,
+                &policy_sha256,
+                &output_arg,
+                &output_path_str,
+                &report_sha256,
+                &(plan.summary.total_violations as i64),
+                &(plan.summary.lock_violations as i64),
+                &(plan.summary.spawn_violations as i64),
+                &(plan.summary.ssot_violations as i64),
+                &(plan.summary.fallback_violations as i64),
+                &(plan.summary.required_config_violations as i64),
+                &(plan.summary.sensitive_violations as i64),
+                &(plan.summary.hardcode_violations as i64),
+                &(plan.summary.style_violations as i64),
+                &(plan.summary.blocking_lock_violations as i64),
+                &(plan.summary.files_affected as i64),
+                &hotspot_cols[0],
+                &hotspot_cols[1],
+                &hotspot_cols[2],
+                &hotspot_cols[3],
+                &hotspot_cols[4],
+                &plan_markdown,
+                &payload,
+            ],
+        )
+        .map_err(|e| format!("insert failed: {e}"))?;
+
+    println!("✅ Logged analyze run to DB table analysis");
+    Ok(())
 }
 
 fn run_rg_policy_scoped(
