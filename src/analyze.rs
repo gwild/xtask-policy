@@ -441,7 +441,7 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
 
     // Scan for "NO CACHE before loop" (GUI-tunable SSOT values cached before iteration begins)
     // NOTE: This is not a regex class; it's a code-level policy check (same bug class as cached x_step).
-    violations.extend(no_cache_before_loop_violations(scan_root));
+    violations.extend(no_cache_before_loop_violations(scan_root, &config.allowlists.ssot_cache_allowed));
 
     // Generate summary
     let lock_violations = violations
@@ -591,12 +591,14 @@ fn scan_pattern(
     Ok(results)
 }
 
-fn no_cache_before_loop_violations(scan_root: &Path) -> Vec<Violation> {
+fn no_cache_before_loop_violations(scan_root: &Path, ssot_cache_allowed: &[String]) -> Vec<Violation> {
     // This is the same bug class as cached x_step: GUI-tunable values read once into locals,
     // then used inside a loop while the GUI can update them mid-run.
     //
     // Policy: in any function containing a loop, any `let <ident> = <ssot_read>` before the first
     // loop keyword is a violation IF `<ident>` is used after the loop begins.
+    //
+    // Files matching ssot_cache_allowed are skipped (intentional immediate-mode GUI reads).
 
     fn walk_rs_files(root: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -721,6 +723,11 @@ fn no_cache_before_loop_violations(scan_root: &Path) -> Vec<Violation> {
             .unwrap_or(&file)
             .display()
             .to_string();
+
+        // Skip files in the ssot_cache_allowed list (intentional immediate-mode GUI reads)
+        if ssot_cache_allowed.iter().any(|allowed| rel_path.contains(allowed)) {
+            continue;
+        }
 
         let lines: Vec<&str> = content.lines().collect();
         let mut fn_starts: Vec<usize> = vec![];

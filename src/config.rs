@@ -109,6 +109,8 @@ pub struct Allowlists {
     pub forbidden_allowed: Vec<String>,
     #[serde(default)]
     pub blocking_lock_allowed: Vec<String>,
+    #[serde(default)]
+    pub ssot_cache_allowed: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
