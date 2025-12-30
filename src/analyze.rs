@@ -29,8 +29,10 @@ pub enum ViolationType {
     Sensitive(String),
     Hardcode(String),
     Style(String),
-    BlockingLock(String), // blocking lock in dangerous path (e.g., GUI thread)
-    NoCache,              // GUI/SSOT value cached before a loop iteration begins
+    BlockingLock(String),   // blocking lock in dangerous path (e.g., GUI thread)
+    HardcodedSleep(String), // hardcoded thread::sleep in dangerous path - use config rest periods
+    HardcodedLiteral(String), // hardcoded numeric literal - use config values
+    NoCache,                // GUI/SSOT value cached before a loop iteration begins
 }
 
 #[derive(Debug)]
@@ -49,12 +51,17 @@ pub struct HotspotEntry {
     pub lock_violations: usize,
     pub spawn_violations: usize,
     pub ssot_violations: usize,
+    pub ssot_leakage_violations: usize,
+    pub ssot_cache_violations: usize,
     pub fallback_violations: usize,
     pub required_config_violations: usize,
     pub sensitive_violations: usize,
     pub hardcode_violations: usize,
+    pub hardcoded_literal_violations: usize,
+    pub hardcoded_sleep_violations: usize,
     pub style_violations: usize,
     pub blocking_lock_violations: usize,
+    pub no_cache_violations: usize,
 }
 
 pub fn file_breakdown(plan: &CleanupPlan) -> Vec<HotspotEntry> {
@@ -79,12 +86,17 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
     let mut by_file_lock: HashMap<&str, usize> = HashMap::new();
     let mut by_file_spawn: HashMap<&str, usize> = HashMap::new();
     let mut by_file_ssot: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_ssot_leakage: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_ssot_cache: HashMap<&str, usize> = HashMap::new();
     let mut by_file_fallback: HashMap<&str, usize> = HashMap::new();
     let mut by_file_required_config: HashMap<&str, usize> = HashMap::new();
     let mut by_file_sensitive: HashMap<&str, usize> = HashMap::new();
     let mut by_file_hardcode: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_hardcoded_literal: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_hardcoded_sleep: HashMap<&str, usize> = HashMap::new();
     let mut by_file_style: HashMap<&str, usize> = HashMap::new();
     let mut by_file_blocking_lock: HashMap<&str, usize> = HashMap::new();
+    let mut by_file_no_cache: HashMap<&str, usize> = HashMap::new();
 
     for v in &plan.violations {
         *by_file_total.entry(v.file.as_str()).or_insert(0) += 1;
@@ -95,8 +107,14 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
             ViolationType::Spawn => {
                 *by_file_spawn.entry(v.file.as_str()).or_insert(0) += 1;
             }
-            ViolationType::Ssot(_) | ViolationType::NoCache => {
+            ViolationType::Ssot(_) => {
                 *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_ssot_leakage.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::NoCache => {
+                *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_ssot_cache.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_no_cache.entry(v.file.as_str()).or_insert(0) += 1;
             }
             ViolationType::FailFast(_) => {
                 *by_file_fallback.entry(v.file.as_str()).or_insert(0) += 1;
@@ -109,6 +127,14 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
             }
             ViolationType::Hardcode(_) => {
                 *by_file_hardcode.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::HardcodedLiteral(_) => {
+                *by_file_hardcode.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_hardcoded_literal.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::HardcodedSleep(_) => {
+                *by_file_blocking_lock.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_hardcoded_sleep.entry(v.file.as_str()).or_insert(0) += 1;
             }
             ViolationType::Style(_) => {
                 *by_file_style.entry(v.file.as_str()).or_insert(0) += 1;
@@ -131,54 +157,37 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
         None => Box::new(files_sorted.into_iter()),
     };
     for (file, total) in iter {
-        let lock_violations = match by_file_lock.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let spawn_violations = match by_file_spawn.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let ssot_violations = match by_file_ssot.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let fallback_violations = match by_file_fallback.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let required_config_violations = match by_file_required_config.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let sensitive_violations = match by_file_sensitive.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let hardcode_violations = match by_file_hardcode.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let style_violations = match by_file_style.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let blocking_lock_violations = match by_file_blocking_lock.get(file) {
-            Some(v) => *v,
-            None => 0,
-        };
+        let lock_violations = by_file_lock.get(file).copied().unwrap_or(0);
+        let spawn_violations = by_file_spawn.get(file).copied().unwrap_or(0);
+        let ssot_violations = by_file_ssot.get(file).copied().unwrap_or(0);
+        let ssot_leakage_violations = by_file_ssot_leakage.get(file).copied().unwrap_or(0);
+        let ssot_cache_violations = by_file_ssot_cache.get(file).copied().unwrap_or(0);
+        let fallback_violations = by_file_fallback.get(file).copied().unwrap_or(0);
+        let required_config_violations = by_file_required_config.get(file).copied().unwrap_or(0);
+        let sensitive_violations = by_file_sensitive.get(file).copied().unwrap_or(0);
+        let hardcode_violations = by_file_hardcode.get(file).copied().unwrap_or(0);
+        let hardcoded_literal_violations = by_file_hardcoded_literal.get(file).copied().unwrap_or(0);
+        let hardcoded_sleep_violations = by_file_hardcoded_sleep.get(file).copied().unwrap_or(0);
+        let style_violations = by_file_style.get(file).copied().unwrap_or(0);
+        let blocking_lock_violations = by_file_blocking_lock.get(file).copied().unwrap_or(0);
+        let no_cache_violations = by_file_no_cache.get(file).copied().unwrap_or(0);
         out.push(HotspotEntry {
             file: file.to_string(),
             total,
             lock_violations,
             spawn_violations,
             ssot_violations,
+            ssot_leakage_violations,
+            ssot_cache_violations,
             fallback_violations,
             required_config_violations,
             sensitive_violations,
             hardcode_violations,
+            hardcoded_literal_violations,
+            hardcoded_sleep_violations,
             style_violations,
             blocking_lock_violations,
+            no_cache_violations,
         });
     }
     out
@@ -201,8 +210,11 @@ pub struct PlanSummary {
     pub required_config_violations: usize,
     pub sensitive_violations: usize,
     pub hardcode_violations: usize,
+    pub hardcoded_literal_violations: usize,
+    pub hardcoded_sleep_violations: usize,
     pub style_violations: usize,
     pub blocking_lock_violations: usize,
+    pub no_cache_violations: usize,
     pub files_affected: usize,
 }
 
@@ -439,6 +451,56 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         }
     }
 
+    // Scan for hardcoded sleep patterns in dangerous paths (e.g., GUI/IPC code)
+    // These are thread::sleep() calls with hardcoded durations that violate event-driven architecture
+    for class in &config.patterns.hardcoded_sleep_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &Vec::new() // No global allowlist for sleeps
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                // Only flag if the file is in a dangerous path (e.g., gui/)
+                let is_dangerous = class.dangerous_paths.is_empty() 
+                    || class.dangerous_paths.iter().any(|p| file.contains(p));
+                if is_dangerous {
+                    violations.push(Violation {
+                        rule: format!("Hardcoded sleep ({}) - use configured rest periods", class.name),
+                        file: file.clone(),
+                        line,
+                        pattern: pattern.clone(),
+                        violation_type: ViolationType::HardcodedSleep(class.name.clone()),
+                        category: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Scan for hardcoded literal patterns (magic numbers that should come from config)
+    for class in &config.patterns.hardcoded_literal_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &Vec::new()
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                violations.push(Violation {
+                    rule: format!("Hardcoded literal ({}) - use config values", class.name),
+                    file: file.clone(),
+                    line,
+                    pattern: pattern.clone(),
+                    violation_type: ViolationType::HardcodedLiteral(class.name.clone()),
+                    category: None,
+                });
+            }
+        }
+    }
+
     // Scan for "NO CACHE before loop" (GUI-tunable SSOT values cached before iteration begins)
     // NOTE: This is not a regex class; it's a code-level policy check (same bug class as cached x_step).
     violations.extend(no_cache_before_loop_violations(scan_root, &config.allowlists.ssot_cache_allowed));
@@ -472,6 +534,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Hardcode(_)))
         .count();
+    let hardcoded_literal_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::HardcodedLiteral(_)))
+        .count();
     let style_violations = violations
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Style(_)))
@@ -479,6 +545,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
     let blocking_lock_violations = violations
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::BlockingLock(_)))
+        .count();
+    let hardcoded_sleep_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::HardcodedSleep(_)))
         .count();
     let ssot_cache_violations = violations
         .iter()
@@ -515,8 +585,11 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         required_config_violations,
         sensitive_violations,
         hardcode_violations,
+        hardcoded_literal_violations,
+        hardcoded_sleep_violations,
         style_violations,
         blocking_lock_violations,
+        no_cache_violations: ssot_cache_violations,
         files_affected: files_affected.len(),
     };
 
@@ -1482,6 +1555,8 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::Hardcode(name) => name,
             ViolationType::Style(name) => name,
             ViolationType::BlockingLock(name) => name,
+            ViolationType::HardcodedSleep(name) => name,
+            ViolationType::HardcodedLiteral(name) => name,
             ViolationType::NoCache => "NoCache",
         };
         let category = match &v.category {

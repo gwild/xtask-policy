@@ -14,12 +14,17 @@ enum Metric {
     LockViolations,
     SpawnViolations,
     SsotViolations,
+    SsotLeakageViolations,
+    SsotCacheViolations,
     FallbackViolations,
     RequiredConfigViolations,
     SensitiveViolations,
     HardcodeViolations,
+    HardcodedLiteralViolations,
+    HardcodedSleepViolations,
     StyleViolations,
     BlockingLockViolations,
+    NoCacheViolations,
     FilesAffected,
 }
 
@@ -31,12 +36,17 @@ fn metric_color(m: Metric) -> egui::Color32 {
         Metric::LockViolations => egui::Color32::from_rgb(90, 180, 90),         // green
         Metric::SpawnViolations => egui::Color32::from_rgb(160, 110, 240),      // purple
         Metric::SsotViolations => egui::Color32::from_rgb(70, 200, 200),        // cyan
+        Metric::SsotLeakageViolations => egui::Color32::from_rgb(50, 180, 180), // cyan-dark
+        Metric::SsotCacheViolations => egui::Color32::from_rgb(100, 220, 220),  // cyan-light
         Metric::FallbackViolations => egui::Color32::from_rgb(70, 130, 220),    // blue
         Metric::RequiredConfigViolations => egui::Color32::from_rgb(140, 140, 140), // gray-alt
         Metric::SensitiveViolations => egui::Color32::from_rgb(240, 90, 200),   // magenta
         Metric::HardcodeViolations => egui::Color32::from_rgb(235, 140, 45),    // orange
+        Metric::HardcodedLiteralViolations => egui::Color32::from_rgb(255, 165, 0), // orange-bright
+        Metric::HardcodedSleepViolations => egui::Color32::from_rgb(200, 100, 30),  // orange-dark
         Metric::StyleViolations => egui::Color32::from_rgb(210, 200, 60),       // yellow-ish
         Metric::BlockingLockViolations => egui::Color32::from_rgb(220, 80, 60), // red-ish
+        Metric::NoCacheViolations => egui::Color32::from_rgb(180, 60, 180),     // purple-ish
     }
 }
 
@@ -53,12 +63,17 @@ impl Metric {
             Metric::LockViolations => "lock_violations",
             Metric::SpawnViolations => "spawn_violations",
             Metric::SsotViolations => "ssot_violations",
+            Metric::SsotLeakageViolations => "ssot_leakage_violations",
+            Metric::SsotCacheViolations => "ssot_cache_violations",
             Metric::FallbackViolations => "fallback_violations",
             Metric::RequiredConfigViolations => "required_config_violations",
             Metric::SensitiveViolations => "sensitive_violations",
             Metric::HardcodeViolations => "hardcode_violations",
+            Metric::HardcodedLiteralViolations => "hardcoded_literal_violations",
+            Metric::HardcodedSleepViolations => "hardcoded_sleep_violations",
             Metric::StyleViolations => "style_violations",
             Metric::BlockingLockViolations => "blocking_lock_violations",
+            Metric::NoCacheViolations => "no_cache_violations",
             Metric::FilesAffected => "files_affected",
         }
     }
@@ -69,12 +84,17 @@ impl Metric {
             Metric::LockViolations,
             Metric::SpawnViolations,
             Metric::SsotViolations,
+            Metric::SsotLeakageViolations,
+            Metric::SsotCacheViolations,
             Metric::FallbackViolations,
             Metric::RequiredConfigViolations,
             Metric::SensitiveViolations,
             Metric::HardcodeViolations,
+            Metric::HardcodedLiteralViolations,
+            Metric::HardcodedSleepViolations,
             Metric::StyleViolations,
             Metric::BlockingLockViolations,
+            Metric::NoCacheViolations,
             Metric::FilesAffected,
         ]
     }
@@ -116,12 +136,17 @@ struct FileBreakdownEntry {
     lock_violations: i64,
     spawn_violations: i64,
     ssot_violations: i64,
+    ssot_leakage_violations: i64,
+    ssot_cache_violations: i64,
     fallback_violations: i64,
     required_config_violations: i64,
     sensitive_violations: i64,
     hardcode_violations: i64,
+    hardcoded_literal_violations: i64,
+    hardcoded_sleep_violations: i64,
     style_violations: i64,
     blocking_lock_violations: i64,
+    no_cache_violations: i64,
 }
 
 struct PlotApp {
@@ -738,12 +763,17 @@ SELECT
   lock_violations,
   spawn_violations,
   ssot_violations,
+  COALESCE(ssot_leakage_violations, 0) as ssot_leakage_violations,
+  COALESCE(ssot_cache_violations, 0) as ssot_cache_violations,
   fallback_violations,
   required_config_violations,
   sensitive_violations,
   hardcode_violations,
+  COALESCE(hardcoded_literal_violations, 0) as hardcoded_literal_violations,
+  COALESCE(hardcoded_sleep_violations, 0) as hardcoded_sleep_violations,
   style_violations,
   blocking_lock_violations,
+  COALESCE(no_cache_violations, 0) as no_cache_violations,
   files_affected
 FROM analysis
 WHERE recorded_at >= $1 AND recorded_at <= $2
@@ -760,18 +790,23 @@ ORDER BY recorded_at ASC
 
     for row in rows {
         let t: DateTime<Utc> = row.get::<_, DateTime<Utc>>(0);
-        let vals: [i64; 11] = [
-            row.get::<_, i64>(1),
-            row.get::<_, i64>(2),
-            row.get::<_, i64>(3),
-            row.get::<_, i64>(4),
-            row.get::<_, i64>(5),
-            row.get::<_, i64>(6),
-            row.get::<_, i64>(7),
-            row.get::<_, i64>(8),
-            row.get::<_, i64>(9),
-            row.get::<_, i64>(10),
-            row.get::<_, i64>(11),
+        let vals: [i64; 16] = [
+            row.get::<_, i64>(1),  // total_violations
+            row.get::<_, i64>(2),  // lock_violations
+            row.get::<_, i64>(3),  // spawn_violations
+            row.get::<_, i64>(4),  // ssot_violations
+            row.get::<_, i64>(5),  // ssot_leakage_violations
+            row.get::<_, i64>(6),  // ssot_cache_violations
+            row.get::<_, i64>(7),  // fallback_violations
+            row.get::<_, i64>(8),  // required_config_violations
+            row.get::<_, i64>(9),  // sensitive_violations
+            row.get::<_, i64>(10), // hardcode_violations
+            row.get::<_, i64>(11), // hardcoded_literal_violations
+            row.get::<_, i64>(12), // hardcoded_sleep_violations
+            row.get::<_, i64>(13), // style_violations
+            row.get::<_, i64>(14), // blocking_lock_violations
+            row.get::<_, i64>(15), // no_cache_violations
+            row.get::<_, i64>(16), // files_affected
         ];
 
         let metrics = Metric::all();
@@ -859,6 +894,16 @@ LIMIT 1
             .context("payload_json.by_file entry missing ssot_violations")?
             .as_u64()
             .context("payload_json.by_file.ssot_violations is not a u64")? as i64;
+        let ssot_leakage_violations = obj
+            .get("ssot_leakage_violations")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i64)
+            .unwrap_or(0);
+        let ssot_cache_violations = obj
+            .get("ssot_cache_violations")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i64)
+            .unwrap_or(0);
         let fallback_violations = obj
             .get("fallback_violations")
             .context("payload_json.by_file entry missing fallback_violations")?
@@ -879,6 +924,16 @@ LIMIT 1
             .context("payload_json.by_file entry missing hardcode_violations")?
             .as_u64()
             .context("payload_json.by_file.hardcode_violations is not a u64")? as i64;
+        let hardcoded_literal_violations = obj
+            .get("hardcoded_literal_violations")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i64)
+            .unwrap_or(0);
+        let hardcoded_sleep_violations = obj
+            .get("hardcoded_sleep_violations")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i64)
+            .unwrap_or(0);
         let style_violations = obj
             .get("style_violations")
             .context("payload_json.by_file entry missing style_violations")?
@@ -889,6 +944,11 @@ LIMIT 1
             .context("payload_json.by_file entry missing blocking_lock_violations")?
             .as_u64()
             .context("payload_json.by_file.blocking_lock_violations is not a u64")? as i64;
+        let no_cache_violations = obj
+            .get("no_cache_violations")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as i64)
+            .unwrap_or(0);
 
         out.push(FileBreakdownEntry {
             file,
@@ -896,12 +956,17 @@ LIMIT 1
             lock_violations,
             spawn_violations,
             ssot_violations,
+            ssot_leakage_violations,
+            ssot_cache_violations,
             fallback_violations,
             required_config_violations,
             sensitive_violations,
             hardcode_violations,
+            hardcoded_literal_violations,
+            hardcoded_sleep_violations,
             style_violations,
             blocking_lock_violations,
+            no_cache_violations,
         });
     }
 

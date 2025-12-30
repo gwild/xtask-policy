@@ -165,6 +165,25 @@ pub struct BlockingLockClass {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct HardcodedSleepClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    /// Paths where hardcoded sleeps are considered dangerous (e.g., GUI code)
+    #[serde(default)]
+    pub dangerous_paths: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HardcodedLiteralClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct Patterns {
     pub lock_patterns: Vec<String>,
     pub spawn_patterns: Vec<String>,
@@ -182,6 +201,10 @@ pub struct Patterns {
     pub style_classes: Vec<StyleClass>,
     #[serde(default)]
     pub blocking_lock_classes: Vec<BlockingLockClass>,
+    #[serde(default)]
+    pub hardcoded_sleep_classes: Vec<HardcodedSleepClass>,
+    #[serde(default)]
+    pub hardcoded_literal_classes: Vec<HardcodedLiteralClass>,
 }
 
 #[derive(Debug, serde::Deserialize)]
