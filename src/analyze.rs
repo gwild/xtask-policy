@@ -1175,6 +1175,14 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         plan.summary.hardcode_violations
     ));
     output.push_str(&format!(
+        "  - **Hardcoded Literals**: {}\n",
+        plan.summary.hardcoded_literal_violations
+    ));
+    output.push_str(&format!(
+        "  - **Hardcoded Sleeps**: {}\n",
+        plan.summary.hardcoded_sleep_violations
+    ));
+    output.push_str(&format!(
         "- **Style Violations**: {}\n",
         plan.summary.style_violations
     ));
