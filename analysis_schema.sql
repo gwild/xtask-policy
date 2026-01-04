@@ -29,7 +29,7 @@ CREATE TABLE analysis (
   fallback_violations BIGINT NOT NULL,
   required_config_violations BIGINT NOT NULL,
   sensitive_violations BIGINT NOT NULL,
-  hardcode_violations BIGINT NOT NULL,
+  hardcoded_path_violations BIGINT NOT NULL DEFAULT 0,
   hardcoded_literal_violations BIGINT NOT NULL DEFAULT 0,
   hardcoded_sleep_violations BIGINT NOT NULL DEFAULT 0,
   style_violations BIGINT NOT NULL,
