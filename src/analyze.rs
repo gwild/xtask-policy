@@ -26,6 +26,7 @@ pub enum ViolationType {
     Ssot(String), // state type name
     FailFast(String),
     RequiredConfig,
+    Forbidden(String),
     Sensitive(String),
     Hardcode(String),
     Style(String),
@@ -207,6 +208,7 @@ pub struct PlanSummary {
     pub ssot_cache_gui_violations: usize,
     pub ssot_cache_non_gui_violations: usize,
     pub fallback_violations: usize,
+    pub forbidden_violations: usize,
     pub required_config_violations: usize,
     pub sensitive_violations: usize,
     pub hardcode_violations: usize,
@@ -415,6 +417,30 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         }
     }
 
+    // Scan for forbidden patterns (mechanical bans that should show up in cleanup plan).
+    // NOTE: `xtask check` additionally scopes forbidden patterns to code paths and excludes docs/.
+    // For cleanup analysis we scan the whole repo (minus default rg excludes) but still respect allowlists.
+    for class in &config.patterns.forbidden_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &config.allowlists.forbidden_allowed
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                violations.push(Violation {
+                    rule: format!("Forbidden patterns ({}) outside allowlist", class.name),
+                    file: file.clone(),
+                    line,
+                    pattern: pattern.clone(),
+                    violation_type: ViolationType::Forbidden(class.name.clone()),
+                    category: None,
+                });
+            }
+        }
+    }
+
     // Scan for blocking lock patterns in dangerous paths (e.g., GUI code)
     // These are .lock() calls that could block the main thread and freeze the UI
     for class in &config.patterns.blocking_lock_classes {
@@ -522,6 +548,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::FailFast(_)))
         .count();
+    let forbidden_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::Forbidden(_)))
+        .count();
     let required_config_violations = violations
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::RequiredConfig))
@@ -582,6 +612,7 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         ssot_cache_gui_violations,
         ssot_cache_non_gui_violations,
         fallback_violations: fail_fast_violations,
+        forbidden_violations,
         required_config_violations,
         sensitive_violations,
         hardcode_violations,
@@ -1163,6 +1194,10 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         plan.summary.fallback_violations
     ));
     output.push_str(&format!(
+        "- **Forbidden Pattern Violations**: {}\n",
+        plan.summary.forbidden_violations
+    ));
+    output.push_str(&format!(
         "- **Required Config Violations**: {}\n",
         plan.summary.required_config_violations
     ));
@@ -1551,6 +1586,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::Ssot(name) => name,
             ViolationType::FailFast(name) => name,
             ViolationType::RequiredConfig => "RequiredConfig",
+                ViolationType::Forbidden(name) => name,
             ViolationType::Sensitive(name) => name,
             ViolationType::Hardcode(name) => name,
             ViolationType::Style(name) => name,
