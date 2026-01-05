@@ -19,7 +19,7 @@ enum Metric {
     FallbackViolations,
     RequiredConfigViolations,
     SensitiveViolations,
-    HardcodeViolations,
+    HardcodedPathViolations,
     HardcodedLiteralViolations,
     HardcodedSleepViolations,
     StyleViolations,
@@ -41,7 +41,7 @@ fn metric_color(m: Metric) -> egui::Color32 {
         Metric::FallbackViolations => egui::Color32::from_rgb(70, 130, 220),    // blue
         Metric::RequiredConfigViolations => egui::Color32::from_rgb(140, 140, 140), // gray-alt
         Metric::SensitiveViolations => egui::Color32::from_rgb(240, 90, 200),   // magenta
-        Metric::HardcodeViolations => egui::Color32::from_rgb(235, 140, 45),    // orange
+        Metric::HardcodedPathViolations => egui::Color32::from_rgb(200, 80, 200), // purple-magenta
         Metric::HardcodedLiteralViolations => egui::Color32::from_rgb(255, 165, 0), // orange-bright
         Metric::HardcodedSleepViolations => egui::Color32::from_rgb(200, 100, 30),  // orange-dark
         Metric::StyleViolations => egui::Color32::from_rgb(210, 200, 60),       // yellow-ish
@@ -54,6 +54,7 @@ fn metric_color(m: Metric) -> egui::Color32 {
 enum ViewMode {
     TimeSeries,
     ByFile,
+    BySubtype,
 }
 
 impl Metric {
@@ -68,7 +69,7 @@ impl Metric {
             Metric::FallbackViolations => "fallback_violations",
             Metric::RequiredConfigViolations => "required_config_violations",
             Metric::SensitiveViolations => "sensitive_violations",
-            Metric::HardcodeViolations => "hardcode_violations",
+            Metric::HardcodedPathViolations => "hardcoded_path_violations",
             Metric::HardcodedLiteralViolations => "hardcoded_literal_violations",
             Metric::HardcodedSleepViolations => "hardcoded_sleep_violations",
             Metric::StyleViolations => "style_violations",
@@ -89,7 +90,7 @@ impl Metric {
             Metric::FallbackViolations,
             Metric::RequiredConfigViolations,
             Metric::SensitiveViolations,
-            Metric::HardcodeViolations,
+            Metric::HardcodedPathViolations,
             Metric::HardcodedLiteralViolations,
             Metric::HardcodedSleepViolations,
             Metric::StyleViolations,
@@ -121,6 +122,7 @@ struct QueryResult {
     // Per-file breakdown from the newest analysis row inside the selected range.
     by_file_recorded_at: DateTime<Utc>,
     by_file: Vec<FileBreakdownEntry>,
+    by_subtype: Vec<SubtypeBreakdownEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,12 +143,27 @@ struct FileBreakdownEntry {
     fallback_violations: i64,
     required_config_violations: i64,
     sensitive_violations: i64,
-    hardcode_violations: i64,
+    hardcoded_path_violations: i64,
     hardcoded_literal_violations: i64,
     hardcoded_sleep_violations: i64,
     style_violations: i64,
     blocking_lock_violations: i64,
     no_cache_violations: i64,
+}
+
+#[derive(Clone, Debug)]
+struct SubtypeFileEntry {
+    file: String,
+    count: i64,
+}
+
+#[derive(Clone, Debug)]
+struct SubtypeBreakdownEntry {
+    category: String,
+    subtype: String,
+    kind: String,
+    count: i64,
+    top_files: Vec<SubtypeFileEntry>,
 }
 
 struct PlotApp {
@@ -163,6 +180,8 @@ struct PlotApp {
     muted: std::collections::HashSet<Metric>,
 
     max_files: usize,
+    subtype_filter: String,
+    selected_subtype: Option<(String, String)>, // (category, subtype)
 
     // Background query
     tx_req: mpsc::Sender<QueryRequest>,
@@ -171,6 +190,27 @@ struct PlotApp {
     last_result: Option<QueryResult>,
     last_error: Option<String>,
     waiting_for_result: bool,
+}
+
+fn require_env(key: &str) -> anyhow::Result<String> {
+    let v = std::env::var(key).with_context(|| format!("{key} not set"))?;
+    if v.trim().is_empty() {
+        return Err(anyhow::anyhow!("{key} is set but empty"));
+    }
+    Ok(v)
+}
+
+fn build_db_url_from_pg_env() -> anyhow::Result<String> {
+    // Percent-encode only '#' which is known to appear in this repo's password and breaks URLs.
+    let user = require_env("PG_USER")?;
+    let password = require_env("PG_PASSWORD")?.replace('#', "%23");
+    let host = require_env("PG_HOST")?;
+    let port = require_env("PG_PORT")?;
+    let dbname = require_env("PG_XTASK_DATABASE")?;
+    Ok(format!(
+        "postgres://{}:{}@{}:{}/{}",
+        user, password, host, port, dbname
+    ))
 }
 
 impl PlotApp {
@@ -209,6 +249,8 @@ impl PlotApp {
             view_mode: ViewMode::TimeSeries,
             muted: std::collections::HashSet::new(),
             max_files: 20,
+            subtype_filter: String::new(),
+            selected_subtype: None,
             tx_req,
             rx_res,
             last_result: None,
@@ -282,6 +324,12 @@ impl eframe::App for PlotApp {
                     .clicked()
                 {
                     self.view_mode = ViewMode::ByFile;
+                }
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::BySubtype, "By subtype")
+                    .clicked()
+                {
+                    self.view_mode = ViewMode::BySubtype;
                 }
 
                 ui.separator();
@@ -368,6 +416,40 @@ impl eframe::App for PlotApp {
                         self.muted.clear();
                     }
                 }
+                ViewMode::BySubtype => {
+                    ui.label("Subtype filter:");
+                    ui.add(egui::TextEdit::singleline(&mut self.subtype_filter).desired_width(f32::INFINITY));
+                    ui.separator();
+
+                    let Some(result) = self.last_result.as_ref() else {
+                        ui.label("No data yet.");
+                        return;
+                    };
+
+                    let filter = self.subtype_filter.trim().to_lowercase();
+                    let mut items = result.by_subtype.clone();
+                    items.sort_by(|a, b| {
+                        b.count
+                            .cmp(&a.count)
+                            .then_with(|| a.kind.cmp(&b.kind))
+                            .then_with(|| a.category.cmp(&b.category))
+                            .then_with(|| a.subtype.cmp(&b.subtype))
+                    });
+
+                    for it in items {
+                        let label = format!("{} / {} / {} = {}", it.kind, it.category, it.subtype, it.count);
+                        if !filter.is_empty() && !label.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        let selected = self
+                            .selected_subtype
+                            .as_ref()
+                            .is_some_and(|(c, s)| c == &it.category && s == &it.subtype);
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.selected_subtype = Some((it.category.clone(), it.subtype.clone()));
+                        }
+                    }
+                }
             }
         });
 
@@ -452,7 +534,7 @@ impl eframe::App for PlotApp {
                     let color_fallback = metric_color(Metric::FallbackViolations);
                     let color_required = metric_color(Metric::RequiredConfigViolations);
                     let color_sensitive = metric_color(Metric::SensitiveViolations);
-                    let color_hardcode = metric_color(Metric::HardcodeViolations);
+                    let color_hardcoded_path = metric_color(Metric::HardcodedPathViolations);
                     let color_style = metric_color(Metric::StyleViolations);
                     let color_blocking_lock = metric_color(Metric::BlockingLockViolations);
 
@@ -600,18 +682,18 @@ impl eframe::App for PlotApp {
                     }
 
                     let files_tt = full_files.clone();
-                    if !self.muted.contains(&Metric::HardcodeViolations) {
+                    if !self.muted.contains(&Metric::HardcodedPathViolations) {
                         let mut bars = vec![];
                         for (idx, e) in items.iter().enumerate() {
-                            bars.push(Bar::new(idx as f64, e.hardcode_violations as f64));
+                            bars.push(Bar::new(idx as f64, e.hardcoded_path_violations as f64));
                         }
-                        let label = Metric::HardcodeViolations.label().to_string();
+                        let label = Metric::HardcodedPathViolations.label().to_string();
                         let tt = files_tt.clone();
                         charts.push(
                             BarChart::new(bars)
                                 .name(label.clone())
                                 .width(0.85)
-                                .color(color_hardcode)
+                                .color(color_hardcoded_path)
                                 .element_formatter(Box::new(move |bar, _| {
                                     let i = bar.argument.round() as isize;
                                     if i < 0 || (i as usize) >= tt.len() {
@@ -743,6 +825,40 @@ impl eframe::App for PlotApp {
                         }
                     });
                 }
+                ViewMode::BySubtype => {
+                    ui.label(format!(
+                        "Latest breakdown: {}",
+                        result.by_file_recorded_at.format("%Y-%m-%d %H:%M:%S")
+                    ));
+                    ui.separator();
+
+                    let Some((ref sel_cat, ref sel_sub)) = self.selected_subtype else {
+                        ui.label("Select a subtype on the left to see where it occurs.");
+                        return;
+                    };
+
+                    let entry_opt = result
+                        .by_subtype
+                        .iter()
+                        .find(|e| &e.category == sel_cat && &e.subtype == sel_sub);
+                    let Some(entry) = entry_opt else {
+                        ui.label("Selected subtype not present in latest payload.");
+                        return;
+                    };
+
+                    ui.heading(format!("{} / {} / {}", entry.kind, entry.category, entry.subtype));
+                    ui.label(format!("Count: {}", entry.count));
+                    ui.separator();
+                    ui.label("Top files:");
+
+                    egui::ScrollArea::vertical()
+                        .id_source("by_subtype_files")
+                        .show(ui, |ui| {
+                            for f in &entry.top_files {
+                                ui.monospace(format!("{:>4}  {}", f.count, f.file));
+                            }
+                        });
+                }
             }
         });
     }
@@ -768,7 +884,7 @@ SELECT
   fallback_violations,
   required_config_violations,
   sensitive_violations,
-  hardcode_violations,
+  COALESCE(hardcoded_path_violations, 0) as hardcoded_path_violations,
   COALESCE(hardcoded_literal_violations, 0) as hardcoded_literal_violations,
   COALESCE(hardcoded_sleep_violations, 0) as hardcoded_sleep_violations,
   style_violations,
@@ -800,7 +916,7 @@ ORDER BY recorded_at ASC
             row.get::<_, i64>(7),  // fallback_violations
             row.get::<_, i64>(8),  // required_config_violations
             row.get::<_, i64>(9),  // sensitive_violations
-            row.get::<_, i64>(10), // hardcode_violations
+            row.get::<_, i64>(10), // hardcoded_path_violations
             row.get::<_, i64>(11), // hardcoded_literal_violations
             row.get::<_, i64>(12), // hardcoded_sleep_violations
             row.get::<_, i64>(13), // style_violations
@@ -824,21 +940,22 @@ ORDER BY recorded_at ASC
         out.push(Series { metric: m, points });
     }
 
-    let (by_file_recorded_at, by_file) = fetch_by_file_breakdown(client, start, end)?;
+    let (by_file_recorded_at, by_file, by_subtype) = fetch_latest_breakdowns(client, start, end)?;
     Ok(QueryResult {
         series: out,
         start,
         end,
         by_file_recorded_at,
         by_file,
+        by_subtype,
     })
 }
 
-fn fetch_by_file_breakdown(
+fn fetch_latest_breakdowns(
     client: &mut Client,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-) -> anyhow::Result<(DateTime<Utc>, Vec<FileBreakdownEntry>)> {
+) -> anyhow::Result<(DateTime<Utc>, Vec<FileBreakdownEntry>, Vec<SubtypeBreakdownEntry>)> {
     let row = client
         .query_opt(
             r#"
@@ -919,11 +1036,10 @@ LIMIT 1
             .context("payload_json.by_file entry missing sensitive_violations")?
             .as_u64()
             .context("payload_json.by_file.sensitive_violations is not a u64")? as i64;
-        let hardcode_violations = obj
-            .get("hardcode_violations")
-            .context("payload_json.by_file entry missing hardcode_violations")?
-            .as_u64()
-            .context("payload_json.by_file.hardcode_violations is not a u64")? as i64;
+        let hardcoded_path_violations = match obj.get("hardcoded_path_violations").and_then(|v| v.as_u64()) {
+            Some(v) => v as i64,
+            None => 0,
+        };
         let hardcoded_literal_violations = obj
             .get("hardcoded_literal_violations")
             .and_then(|v| v.as_u64())
@@ -961,7 +1077,7 @@ LIMIT 1
             fallback_violations,
             required_config_violations,
             sensitive_violations,
-            hardcode_violations,
+            hardcoded_path_violations,
             hardcoded_literal_violations,
             hardcoded_sleep_violations,
             style_violations,
@@ -970,21 +1086,92 @@ LIMIT 1
         });
     }
 
-    Ok((recorded_at, out))
+    let by_subtype_raw = payload
+        .get("by_subtype")
+        .context("payload_json missing required key: by_subtype")?
+        .as_array()
+        .context("payload_json.by_subtype is not an array")?;
+    let mut by_subtype: Vec<SubtypeBreakdownEntry> = vec![];
+    for v in by_subtype_raw {
+        let obj = v.as_object().context("payload_json.by_subtype entry is not an object")?;
+        let category = obj
+            .get("category")
+            .context("payload_json.by_subtype entry missing category")?
+            .as_str()
+            .context("payload_json.by_subtype.category is not a string")?
+            .to_string();
+        let subtype = obj
+            .get("subtype")
+            .context("payload_json.by_subtype entry missing subtype")?
+            .as_str()
+            .context("payload_json.by_subtype.subtype is not a string")?
+            .to_string();
+        let kind = obj
+            .get("kind")
+            .context("payload_json.by_subtype entry missing kind")?
+            .as_str()
+            .context("payload_json.by_subtype.kind is not a string")?
+            .to_string();
+        let count = obj
+            .get("count")
+            .context("payload_json.by_subtype entry missing count")?
+            .as_u64()
+            .context("payload_json.by_subtype.count is not a u64")? as i64;
+        let top_files_raw = obj
+            .get("top_files")
+            .context("payload_json.by_subtype entry missing top_files")?
+            .as_array()
+            .context("payload_json.by_subtype.top_files is not an array")?;
+        let mut top_files: Vec<SubtypeFileEntry> = vec![];
+        for tf in top_files_raw {
+            let tf_obj = tf
+                .as_object()
+                .context("payload_json.by_subtype.top_files entry is not an object")?;
+            let file = tf_obj
+                .get("file")
+                .context("payload_json.by_subtype.top_files entry missing file")?
+                .as_str()
+                .context("payload_json.by_subtype.top_files.file is not a string")?
+                .to_string();
+            let c = tf_obj
+                .get("count")
+                .context("payload_json.by_subtype.top_files entry missing count")?
+                .as_u64()
+                .context("payload_json.by_subtype.top_files.count is not a u64")? as i64;
+            top_files.push(SubtypeFileEntry { file, count: c });
+        }
+        by_subtype.push(SubtypeBreakdownEntry {
+            category,
+            subtype,
+            kind,
+            count,
+            top_files,
+        });
+    }
+
+    Ok((recorded_at, out, by_subtype))
 }
 
 fn main() {
+    // Prefer a URL if present and safe; otherwise derive one from PG_* env vars.
     let db_url = match std::env::var("XTASK_ANALYSIS_DB_URL") {
         Ok(v) => v,
-        Err(_) => {
-            eprintln!("FATAL: XTASK_ANALYSIS_DB_URL not set (required for xtask_plot)");
-            std::process::exit(1);
+        Err(_) => "".to_string(),
+    };
+    let db_url = if !db_url.trim().is_empty() && !db_url.contains('#') && !db_url.contains("${") {
+        db_url
+    } else {
+        match build_db_url_from_pg_env() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "FATAL: cannot determine DB connection. Set XTASK_ANALYSIS_DB_URL (URL-safe) or PG_* vars (PG_USER/PG_PASSWORD/PG_HOST/PG_PORT/PG_XTASK_DATABASE). Error: {:#}",
+                    e
+                );
+                std::process::exit(1);
+            }
         }
     };
-    if db_url.trim().is_empty() {
-        eprintln!("FATAL: XTASK_ANALYSIS_DB_URL is empty");
-        std::process::exit(1);
-    }
 
     let options = eframe::NativeOptions::default();
     let res = eframe::run_native(

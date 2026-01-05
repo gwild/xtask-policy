@@ -181,6 +181,29 @@ pub struct HardcodedLiteralClass {
     pub patterns: Vec<String>,
     #[serde(default)]
     pub allowed: Vec<String>,
+    /// Antipatterns: if ANY of these are found in the same file, the violation is suppressed
+    #[serde(default)]
+    pub antipatterns: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HardcodedPathClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub antipatterns: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BuildScriptClass {
+    pub name: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub antipatterns: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -205,6 +228,10 @@ pub struct Patterns {
     pub hardcoded_sleep_classes: Vec<HardcodedSleepClass>,
     #[serde(default)]
     pub hardcoded_literal_classes: Vec<HardcodedLiteralClass>,
+    #[serde(default)]
+    pub hardcoded_path_classes: Vec<HardcodedPathClass>,
+    #[serde(default)]
+    pub build_script_classes: Vec<BuildScriptClass>,
 }
 
 #[derive(Debug, serde::Deserialize)]

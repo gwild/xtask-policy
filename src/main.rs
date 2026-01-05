@@ -1353,27 +1353,8 @@ fn run_analyze(output_file: &str, db_url_arg: Option<&str>) {
             }
             println!("  Strategic outputs: included in the report (see \"Strategic Outputs\" section)");
 
-            let resolved_db_url = match db_url_arg {
-                Some(v) => v.to_string(),
-                None => {
-                    match std::env::var("XTASK_ANALYSIS_DB_URL") {
-                        Ok(v) => {
-                            if v.trim().is_empty() {
-                                eprintln!("FATAL: XTASK_ANALYSIS_DB_URL is empty (required to log analyze runs). Use --no-db to skip logging explicitly.");
-                                std::process::exit(1);
-                            }
-                            v
-                        }
-                        Err(_) => {
-                            eprintln!("FATAL: XTASK_ANALYSIS_DB_URL not configured and --db-url not provided (required to log analyze runs).");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            };
-
             if let Err(e) = log_analyze_to_db(
-                &resolved_db_url,
+                db_url_arg,
                 &ctx,
                 output_file,
                 &output_path,
@@ -1405,7 +1386,7 @@ fn sha256_hex_str(s: &str) -> String {
 }
 
 fn log_analyze_to_db(
-    db_url: &str,
+    db_url_arg: Option<&str>,
     ctx: &config::RepoContext,
     output_arg: &str,
     output_path: &Path,
@@ -1421,6 +1402,7 @@ fn log_analyze_to_db(
 
     let hotspots = analyze::top_hotspots(plan, 5);
     let by_file = analyze::file_breakdown(plan);
+    let by_subtype = analyze::violation_subtype_breakdown(plan, 12);
     let mut hotspot_cols: Vec<Option<String>> = vec![];
     for h in &hotspots {
         hotspot_cols.push(Some(format!(
@@ -1451,16 +1433,18 @@ fn log_analyze_to_db(
             "fallback_violations": plan.summary.fallback_violations,
             "required_config_violations": plan.summary.required_config_violations,
             "sensitive_violations": plan.summary.sensitive_violations,
-            "hardcode_violations": plan.summary.hardcode_violations,
+            "hardcoded_path_violations": plan.summary.hardcoded_path_violations,
             "hardcoded_literal_violations": plan.summary.hardcoded_literal_violations,
             "hardcoded_sleep_violations": plan.summary.hardcoded_sleep_violations,
+            "build_script_violations": plan.summary.build_script_violations,
             "style_violations": plan.summary.style_violations,
             "blocking_lock_violations": plan.summary.blocking_lock_violations,
             "no_cache_violations": plan.summary.no_cache_violations,
             "files_affected": plan.summary.files_affected
         },
         "top_hotspots": hotspots,
-        "by_file": by_file
+        "by_file": by_file,
+        "by_subtype": by_subtype
     });
 
     let host = match std::env::var("HOSTNAME") {
@@ -1469,7 +1453,7 @@ fn log_analyze_to_db(
     };
     let xtask_version = env!("CARGO_PKG_VERSION").to_string();
 
-    let mut client = Client::connect(db_url, NoTls).map_err(|e| format!("connect failed: {e}"))?;
+    let mut client = connect_analysis_db(db_url_arg).map_err(|e| format!("connect failed: {e}"))?;
 
     client
         .execute(
@@ -1492,9 +1476,10 @@ INSERT INTO analysis (
   fallback_violations,
   required_config_violations,
   sensitive_violations,
-  hardcode_violations,
+  hardcoded_path_violations,
   hardcoded_literal_violations,
   hardcoded_sleep_violations,
+  build_script_violations,
   style_violations,
   blocking_lock_violations,
   no_cache_violations,
@@ -1509,9 +1494,9 @@ INSERT INTO analysis (
 )
 VALUES (
   $1,$2,$3,$4,$5,$6,$7,$8,
-  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-  $25,$26,$27,$28,$29,
-  $30,$31
+  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+  $26,$27,$28,$29,$30,
+  $31,$32
 )
 "#,
             &[
@@ -1532,9 +1517,10 @@ VALUES (
                 &(plan.summary.fallback_violations as i64),
                 &(plan.summary.required_config_violations as i64),
                 &(plan.summary.sensitive_violations as i64),
-                &(plan.summary.hardcode_violations as i64),
+                &(plan.summary.hardcoded_path_violations as i64),
                 &(plan.summary.hardcoded_literal_violations as i64),
                 &(plan.summary.hardcoded_sleep_violations as i64),
+                &(plan.summary.build_script_violations as i64),
                 &(plan.summary.style_violations as i64),
                 &(plan.summary.blocking_lock_violations as i64),
                 &(plan.summary.no_cache_violations as i64),
@@ -1548,10 +1534,83 @@ VALUES (
                 &payload,
             ],
         )
-        .map_err(|e| format!("insert failed: {e}"))?;
+        .map_err(|e| {
+            if let Some(db) = e.as_db_error() {
+                format!(
+                    "insert failed: {} (severity={}, code={}, detail={:?}, hint={:?}, where={:?})",
+                    db.message(),
+                    db.severity(),
+                    db.code().code(),
+                    db.detail(),
+                    db.hint(),
+                    db.where_()
+                )
+            } else {
+                format!("insert failed: {e}")
+            }
+        })?;
 
     println!("✅ Logged analyze run to DB table analysis");
     Ok(())
+}
+
+fn require_env(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(v) => {
+            if v.trim().is_empty() {
+                Err(format!("FATAL: {key} is set but empty"))
+            } else {
+                Ok(v)
+            }
+        }
+        Err(_) => Err(format!("FATAL: {key} not configured")),
+    }
+}
+
+fn connect_analysis_db(db_url_arg: Option<&str>) -> Result<Client, String> {
+    // 1) Explicit CLI param wins.
+    if let Some(db_url) = db_url_arg {
+        if db_url.trim().is_empty() {
+            return Err("FATAL: --db-url provided but empty".to_string());
+        }
+        return Client::connect(db_url, NoTls).map_err(|e| format!("{e}"));
+    }
+
+    // 2) If full URL is provided, use it.
+    if let Ok(v) = std::env::var("XTASK_ANALYSIS_DB_URL") {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            return Err("FATAL: XTASK_ANALYSIS_DB_URL is set but empty".to_string());
+        }
+
+        // If the URL contains '#', many URL parsers treat it as a fragment delimiter unless percent-encoded.
+        // Prefer discrete PG_* vars in that case so passwords like '#...' work reliably.
+        if trimmed.contains('#') || trimmed.contains("${") {
+            // Fall through to PG_* connection path below.
+        } else {
+            return Client::connect(trimmed, NoTls).map_err(|e| format!("{e}"));
+        }
+    }
+
+    // 3) Otherwise, connect via discrete env vars so passwords do not need URL-encoding.
+    // This avoids breakage when passwords contain '#' (URL fragment delimiter).
+    let user = require_env("PG_USER")?;
+    let password = require_env("PG_PASSWORD")?;
+    let host = require_env("PG_HOST")?;
+    let port_s = require_env("PG_PORT")?;
+    let dbname = require_env("PG_XTASK_DATABASE")?;
+
+    let port: u16 = port_s
+        .parse::<u16>()
+        .map_err(|e| format!("FATAL: PG_PORT must be a valid u16, got '{port_s}': {e}"))?;
+
+    let mut cfg = postgres::Config::new();
+    cfg.user(&user);
+    cfg.password(password);
+    cfg.host(&host);
+    cfg.port(port);
+    cfg.dbname(&dbname);
+    cfg.connect(NoTls).map_err(|e| format!("{e}"))
 }
 
 fn run_rg_policy_scoped(
