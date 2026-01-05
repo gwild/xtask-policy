@@ -1436,6 +1436,7 @@ fn log_analyze_to_db(
             "hardcoded_path_violations": plan.summary.hardcoded_path_violations,
             "hardcoded_literal_violations": plan.summary.hardcoded_literal_violations,
             "hardcoded_sleep_violations": plan.summary.hardcoded_sleep_violations,
+            "build_script_violations": plan.summary.build_script_violations,
             "style_violations": plan.summary.style_violations,
             "blocking_lock_violations": plan.summary.blocking_lock_violations,
             "no_cache_violations": plan.summary.no_cache_violations,
@@ -1478,6 +1479,7 @@ INSERT INTO analysis (
   hardcoded_path_violations,
   hardcoded_literal_violations,
   hardcoded_sleep_violations,
+  build_script_violations,
   style_violations,
   blocking_lock_violations,
   no_cache_violations,
@@ -1492,9 +1494,9 @@ INSERT INTO analysis (
 )
 VALUES (
   $1,$2,$3,$4,$5,$6,$7,$8,
-  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-  $25,$26,$27,$28,$29,
-  $30,$31
+  $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+  $26,$27,$28,$29,$30,
+  $31,$32
 )
 "#,
             &[
@@ -1518,6 +1520,7 @@ VALUES (
                 &(plan.summary.hardcoded_path_violations as i64),
                 &(plan.summary.hardcoded_literal_violations as i64),
                 &(plan.summary.hardcoded_sleep_violations as i64),
+                &(plan.summary.build_script_violations as i64),
                 &(plan.summary.style_violations as i64),
                 &(plan.summary.blocking_lock_violations as i64),
                 &(plan.summary.no_cache_violations as i64),

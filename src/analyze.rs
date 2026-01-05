@@ -31,7 +31,11 @@ pub enum ViolationType {
     BlockingLock(String),   // blocking lock in dangerous path (e.g., GUI thread)
     HardcodedSleep(String), // hardcoded thread::sleep in dangerous path - use config rest periods
     HardcodedLiteral(String), // hardcoded numeric literal - use config values
+    HardcodedPath,          // hardcoded absolute path - use config values
+    BuildScript,            // build script that doesn't force rebuild
     NoCache,                // GUI/SSOT value cached before a loop iteration begins
+    SsotLeakage,
+    SsotCache,
 }
 
 #[derive(Debug)]
@@ -87,6 +91,8 @@ fn violation_kind(vt: &ViolationType) -> &'static str {
     match vt {
         ViolationType::HardcodedLiteral(_) => "number",
         ViolationType::HardcodedSleep(_) => "timing",
+        ViolationType::HardcodedPath => "path",
+        ViolationType::BuildScript => "build",
         ViolationType::Sensitive(name) => {
             if name.starts_with("abs_path_") {
                 "path"
@@ -100,7 +106,7 @@ fn violation_kind(vt: &ViolationType) -> &'static str {
         }
         ViolationType::RequiredConfig => "config",
         ViolationType::Lock | ViolationType::Spawn | ViolationType::BlockingLock(_) => "concurrency",
-        ViolationType::Ssot(_) | ViolationType::NoCache => "state",
+        ViolationType::Ssot(_) | ViolationType::NoCache | ViolationType::SsotLeakage | ViolationType::SsotCache => "state",
         ViolationType::Style(_) => "style",
         ViolationType::FailFast(_) => "fail_fast",
     }
@@ -111,6 +117,8 @@ fn violation_category_and_subtype(vt: &ViolationType) -> (String, String) {
         ViolationType::Lock => ("lock".to_string(), "lock".to_string()),
         ViolationType::Spawn => ("spawn".to_string(), "spawn".to_string()),
         ViolationType::Ssot(name) => ("ssot".to_string(), name.clone()),
+        ViolationType::SsotLeakage => ("ssot".to_string(), "leakage".to_string()),
+        ViolationType::SsotCache => ("ssot".to_string(), "cache".to_string()),
         ViolationType::FailFast(name) => ("fail_fast".to_string(), name.clone()),
         ViolationType::RequiredConfig => ("required_config".to_string(), "required_config".to_string()),
         ViolationType::Sensitive(name) => ("sensitive".to_string(), name.clone()),
@@ -118,6 +126,8 @@ fn violation_category_and_subtype(vt: &ViolationType) -> (String, String) {
         ViolationType::BlockingLock(name) => ("blocking_lock".to_string(), name.clone()),
         ViolationType::HardcodedSleep(name) => ("hardcoded_sleep".to_string(), name.clone()),
         ViolationType::HardcodedLiteral(name) => ("hardcoded_literal".to_string(), name.clone()),
+        ViolationType::HardcodedPath => ("hardcoded_path".to_string(), "hardcoded_path".to_string()),
+        ViolationType::BuildScript => ("build_script".to_string(), "build_script".to_string()),
         ViolationType::NoCache => ("no_cache".to_string(), "no_cache".to_string()),
     }
 }
@@ -219,6 +229,14 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
                 *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
                 *by_file_ssot_leakage.entry(v.file.as_str()).or_insert(0) += 1;
             }
+            ViolationType::SsotLeakage => {
+                *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_ssot_leakage.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::SsotCache => {
+                *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
+                *by_file_ssot_cache.entry(v.file.as_str()).or_insert(0) += 1;
+            }
             ViolationType::NoCache => {
                 *by_file_ssot.entry(v.file.as_str()).or_insert(0) += 1;
                 *by_file_ssot_cache.entry(v.file.as_str()).or_insert(0) += 1;
@@ -238,6 +256,12 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
             }
             ViolationType::HardcodedLiteral(_) => {
                 *by_file_hardcoded_literal.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::HardcodedPath => {
+                *by_file_hardcoded_path.entry(v.file.as_str()).or_insert(0) += 1;
+            }
+            ViolationType::BuildScript => {
+                // Build script violations tracked separately
             }
             ViolationType::HardcodedSleep(_) => {
                 *by_file_blocking_lock.entry(v.file.as_str()).or_insert(0) += 1;
@@ -319,6 +343,7 @@ pub struct PlanSummary {
     pub hardcoded_path_violations: usize,
     pub hardcoded_literal_violations: usize,
     pub hardcoded_sleep_violations: usize,
+    pub build_script_violations: usize,
     pub style_violations: usize,
     pub blocking_lock_violations: usize,
     pub no_cache_violations: usize,
@@ -596,14 +621,65 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         for pattern in &class.patterns {
             let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
             for (file, line) in found {
-                violations.push(Violation {
-                    rule: format!("Hardcoded literal ({}) - use config values", class.name),
-                    file: file.clone(),
-                    line,
-                    pattern: pattern.clone(),
-                    violation_type: ViolationType::HardcodedLiteral(class.name.clone()),
-                    category: None,
-                });
+                // Check antipatterns - if any antipattern exists in the file, suppress this violation
+                if !file_contains_antipattern(&file, &class.antipatterns, scan_root)? {
+                    violations.push(Violation {
+                        rule: format!("Hardcoded literal ({}) - use config values", class.name),
+                        file: file.clone(),
+                        line,
+                        pattern: pattern.clone(),
+                        violation_type: ViolationType::HardcodedLiteral(class.name.clone()),
+                        category: None,
+                    });
+                }
+            }
+        }
+    }
+    
+    // Scan for hardcoded paths (absolute paths that should come from config)
+    for class in &config.patterns.hardcoded_path_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &Vec::new()
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                if !file_contains_antipattern(&file, &class.antipatterns, scan_root)? {
+                    violations.push(Violation {
+                        rule: format!("Hardcoded path ({}) - use config values", class.name),
+                        file: file.clone(),
+                        line,
+                        pattern: pattern.clone(),
+                        violation_type: ViolationType::HardcodedPath,
+                        category: None,
+                    });
+                }
+            }
+        }
+    }
+    
+    // Scan for build script violations (scripts that don't force rebuild)
+    for class in &config.patterns.build_script_classes {
+        let allow = if !class.allowed.is_empty() {
+            &class.allowed
+        } else {
+            &Vec::new()
+        };
+        for pattern in &class.patterns {
+            let found = scan_pattern(pattern, allow, &config.options.rg_exclude_globs, scan_root)?;
+            for (file, line) in found {
+                if !file_contains_antipattern(&file, &class.antipatterns, scan_root)? {
+                    violations.push(Violation {
+                        rule: format!("Build script ({}) - must force rebuild", class.name),
+                        file: file.clone(),
+                        line,
+                        pattern: pattern.clone(),
+                        violation_type: ViolationType::BuildScript,
+                        category: None,
+                    });
+                }
             }
         }
     }
@@ -657,6 +733,10 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::HardcodedSleep(_)))
         .count();
+    let build_script_violations = violations
+        .iter()
+        .filter(|v| matches!(v.violation_type, ViolationType::BuildScript))
+        .count();
     let ssot_cache_violations = violations
         .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::NoCache))
@@ -694,6 +774,7 @@ pub fn analyze_repo(config: &PolicyConfig, scan_root: &Path) -> Result<CleanupPl
         hardcoded_path_violations,
         hardcoded_literal_violations,
         hardcoded_sleep_violations,
+        build_script_violations,
         style_violations,
         blocking_lock_violations,
         no_cache_violations: ssot_cache_violations,
@@ -769,6 +850,42 @@ fn scan_pattern(
     }
 
     Ok(results)
+}
+
+/// Check if ANY antipattern exists in the given file
+fn file_contains_antipattern(
+    file_path: &str,
+    antipatterns: &[String],
+    scan_root: &Path,
+) -> Result<bool, String> {
+    if antipatterns.is_empty() {
+        return Ok(false);
+    }
+    
+    for antipattern in antipatterns {
+        let args = vec![
+            "-q".to_string(), // Quiet mode - just check if pattern exists
+            "--hidden".to_string(),
+            antipattern.clone(),
+            file_path.to_string(),
+        ];
+        
+        let rg = Command::new("rg")
+            .args(&args)
+            .current_dir(scan_root)
+            .output();
+        
+        let Ok(rg) = rg else {
+            continue; // ripgrep not available, skip this antipattern
+        };
+        
+        // Exit code 0 means pattern was found
+        if rg.status.success() {
+            return Ok(true); // Found an antipattern - suppress violation
+        }
+    }
+    
+    Ok(false) // No antipatterns found
 }
 
 fn no_cache_before_loop_violations(scan_root: &Path, ssot_cache_allowed: &[String]) -> Vec<Violation> {
@@ -1241,6 +1358,8 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
         match vt {
             ViolationType::HardcodedLiteral(_) => "number",
             ViolationType::HardcodedSleep(_) => "timing",
+            ViolationType::HardcodedPath => "path",
+            ViolationType::BuildScript => "build",
             ViolationType::Sensitive(name) => {
                 if name.starts_with("abs_path_") {
                     "path"
@@ -1254,7 +1373,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             }
             ViolationType::RequiredConfig => "config",
             ViolationType::Lock | ViolationType::Spawn | ViolationType::BlockingLock(_) => "concurrency",
-            ViolationType::Ssot(_) | ViolationType::NoCache => "state",
+            ViolationType::Ssot(_) | ViolationType::NoCache | ViolationType::SsotLeakage | ViolationType::SsotCache => "state",
             ViolationType::Style(_) => "style",
             ViolationType::FailFast(_) => "fail-fast",
         }
@@ -1311,6 +1430,10 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
     output.push_str(&format!(
         "  - **Hardcoded Sleeps**: {}\n",
         plan.summary.hardcoded_sleep_violations
+    ));
+    output.push_str(&format!(
+        "- **Build Script Violations**: {}\n",
+        plan.summary.build_script_violations
     ));
     output.push_str(&format!(
         "- **Style Violations**: {}\n",
@@ -1738,6 +1861,8 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::Lock => "Lock",
             ViolationType::Spawn => "Spawn",
             ViolationType::Ssot(name) => name,
+            ViolationType::SsotLeakage => "SsotLeakage",
+            ViolationType::SsotCache => "SsotCache",
             ViolationType::FailFast(name) => name,
             ViolationType::RequiredConfig => "RequiredConfig",
             ViolationType::Sensitive(name) => name,
@@ -1745,6 +1870,8 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::BlockingLock(name) => name,
             ViolationType::HardcodedSleep(name) => name,
             ViolationType::HardcodedLiteral(name) => name,
+            ViolationType::HardcodedPath => "HardcodedPath",
+            ViolationType::BuildScript => "BuildScript",
             ViolationType::NoCache => "NoCache",
         };
         let category = match &v.category {

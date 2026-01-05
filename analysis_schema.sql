@@ -32,6 +32,7 @@ CREATE TABLE analysis (
   hardcoded_path_violations BIGINT NOT NULL DEFAULT 0,
   hardcoded_literal_violations BIGINT NOT NULL DEFAULT 0,
   hardcoded_sleep_violations BIGINT NOT NULL DEFAULT 0,
+  build_script_violations BIGINT NOT NULL DEFAULT 0,
   style_violations BIGINT NOT NULL,
   blocking_lock_violations BIGINT NOT NULL,
   no_cache_violations BIGINT NOT NULL DEFAULT 0,
