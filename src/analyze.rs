@@ -94,6 +94,7 @@ fn violation_kind(vt: &ViolationType) -> &'static str {
         ViolationType::HardcodedSleep(_) => "timing",
         ViolationType::HardcodedPath => "path",
         ViolationType::BuildScript => "build",
+        ViolationType::Forbidden(_) => "forbidden",
         ViolationType::Sensitive(name) => {
             if name.starts_with("abs_path_") {
                 "path"
@@ -122,6 +123,7 @@ fn violation_category_and_subtype(vt: &ViolationType) -> (String, String) {
         ViolationType::SsotCache => ("ssot".to_string(), "cache".to_string()),
         ViolationType::FailFast(name) => ("fail_fast".to_string(), name.clone()),
         ViolationType::RequiredConfig => ("required_config".to_string(), "required_config".to_string()),
+        ViolationType::Forbidden(name) => ("forbidden".to_string(), name.clone()),
         ViolationType::Sensitive(name) => ("sensitive".to_string(), name.clone()),
         ViolationType::Style(name) => ("style".to_string(), name.clone()),
         ViolationType::BlockingLock(name) => ("blocking_lock".to_string(), name.clone()),
@@ -249,6 +251,7 @@ fn file_breakdown_internal(plan: &CleanupPlan, limit: Option<usize>) -> Vec<Hots
             ViolationType::RequiredConfig => {
                 *by_file_required_config.entry(v.file.as_str()).or_insert(0) += 1;
             }
+            ViolationType::Forbidden(_) => {}
             ViolationType::Sensitive(name) => {
                 *by_file_sensitive.entry(v.file.as_str()).or_insert(0) += 1;
                 if name.starts_with("abs_path_") {
@@ -1391,6 +1394,7 @@ pub fn format_plan(plan: &CleanupPlan) -> String {
             ViolationType::HardcodedSleep(_) => "timing",
             ViolationType::HardcodedPath => "path",
             ViolationType::BuildScript => "build",
+            ViolationType::Forbidden(_) => "forbidden",
             ViolationType::Sensitive(name) => {
                 if name.starts_with("abs_path_") {
                     "path"
